@@ -63,6 +63,8 @@ $script:Resizing = $false
 $script:ResizeCorner = ''
 $script:ResizeAnchor = [System.Drawing.PointF]::new([single]0, [single]0)
 $script:OverlaySize = 25
+$script:FfmpegPath = $null
+$script:ChromaCacheDirectory = Join-Path ([System.IO.Path]::GetTempPath()) 'mirror-to-tv-chroma'
 
 $http = New-Object System.Net.Http.HttpClient
 $http.Timeout = [TimeSpan]::FromMinutes(10)
@@ -96,6 +98,16 @@ function Find-Adb {
 }
 
 $script:AdbPath = Find-Adb
+
+function Find-Ffmpeg {
+    $bundled = Join-Path $PSScriptRoot 'tools\ffmpeg.exe'
+    if (Test-Path -LiteralPath $bundled -PathType Leaf) { return $bundled }
+    $command = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($null -ne $command) { return $command.Source }
+    return $null
+}
+
+$script:FfmpegPath = Find-Ffmpeg
 
 function New-Label([string]$Text, [int]$X, [int]$Y, [int]$Width, [int]$Height = 24) {
     $label = New-Object System.Windows.Forms.Label
@@ -279,16 +291,35 @@ function New-MediaPreviewImage([string]$Path) {
     $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
     if ($extension -in @('.mp4', '.m4v', '.webm', '.mkv', '.3gp')) {
         $kind = 'video'
-        $image = [System.Drawing.Bitmap]::new(640, 360)
-        $placeholderGraphics = [System.Drawing.Graphics]::FromImage($image)
-        try {
-            $placeholderGraphics.Clear([System.Drawing.Color]::FromArgb(24, 32, 45))
-            $videoFont = New-Object System.Drawing.Font('Segoe UI Semibold', 28)
-            $videoBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(225, 235, 245))
+        $image = $null
+        if ($null -ne $script:FfmpegPath) {
+            $previewPath = Join-Path ([System.IO.Path]::GetTempPath()) "mirror-to-tv-preview-$([guid]::NewGuid().ToString('N')).png"
             try {
-                $placeholderGraphics.DrawString('▶  VIDEO', $videoFont, $videoBrush, 215, 145)
-            } finally { $videoFont.Dispose(); $videoBrush.Dispose() }
-        } finally { $placeholderGraphics.Dispose() }
+                $arguments = @('-hide_banner', '-loglevel', 'error', '-y', '-ss', '0.2',
+                    '-i', $Path, '-frames:v', '1', '-vf',
+                    'scale=640:360:force_original_aspect_ratio=decrease', $previewPath)
+                & $script:FfmpegPath @arguments 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $previewPath -PathType Leaf)) {
+                    $source = [System.Drawing.Image]::FromFile($previewPath)
+                    try { $image = New-Object System.Drawing.Bitmap -ArgumentList $source }
+                    finally { $source.Dispose() }
+                }
+            } catch { } finally {
+                Remove-Item -LiteralPath $previewPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        if ($null -eq $image) {
+            $image = [System.Drawing.Bitmap]::new(640, 360)
+            $placeholderGraphics = [System.Drawing.Graphics]::FromImage($image)
+            try {
+                $placeholderGraphics.Clear([System.Drawing.Color]::FromArgb(24, 32, 45))
+                $videoFont = New-Object System.Drawing.Font('Segoe UI Semibold', 28)
+                $videoBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(225, 235, 245))
+                try {
+                    $placeholderGraphics.DrawString('▶  VIDEO', $videoFont, $videoBrush, 215, 145)
+                } finally { $videoFont.Dispose(); $videoBrush.Dispose() }
+            } finally { $placeholderGraphics.Dispose() }
+        }
     } else {
         $kind = if ($extension -eq '.gif') { 'gif' } else { 'image' }
         $source = [System.Drawing.Image]::FromFile($Path)
@@ -348,6 +379,7 @@ function Select-MediaItem($Item) {
     }
     Clamp-OverlayPosition
     if ($null -ne $screenPreview) { $screenPreview.Invalidate() }
+    if ($null -ne $chromaButton) { Update-ChromaButton }
 }
 
 function Add-MediaItem([string]$Path, [bool]$AutoTransmit = $true) {
@@ -366,6 +398,12 @@ function Add-MediaItem([string]$Path, [bool]$AutoTransmit = $true) {
         Opacity = [int]$opacitySlider.Value
         VideoMuted = $false
         VideoPaused = $false
+        ChromaEnabled = $false
+        ChromaColor = '00FF00'
+        ChromaTolerance = 30
+        ChromaSoftness = 8
+        ProcessedPath = ''
+        ProcessedSignature = ''
         RemoteVisible = $false
     }
     $script:NextMediaId++
@@ -384,6 +422,20 @@ function Load-SelectedMedia([string]$Path, [bool]$ResetVideoMute = $true) {
     $item.Y = $savedY
     if (-not $ResetVideoMute) { $item.VideoMuted = $savedVideoMute }
     Select-MediaItem $item
+}
+
+function Clear-ChromaMediaCache($Item) {
+    if ($null -eq $Item -or [string]::IsNullOrWhiteSpace([string]$Item.ProcessedPath)) { return }
+    try {
+        $cacheRoot = [System.IO.Path]::GetFullPath($script:ChromaCacheDirectory)
+        $cachedFile = [System.IO.Path]::GetFullPath([string]$Item.ProcessedPath)
+        if ($cachedFile.StartsWith($cacheRoot + [System.IO.Path]::DirectorySeparatorChar,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            Remove-Item -LiteralPath $cachedFile -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $Item.ProcessedPath = ''
+    }
 }
 
 function Get-MediaItemRectangle($Item) {
@@ -583,6 +635,7 @@ function Remove-MediaItem($Item) {
         Select-MediaItem $nextItem
     }
     if ($null -ne $Item.Image) { $Item.Image.Dispose() }
+    Clear-ChromaMediaCache $Item
     $script:OverlayActive = @($script:MediaItems | Where-Object { $_.RemoteVisible }).Count -gt 0
     Reset-MoveStream
     $screenPreview.Invalidate()
@@ -915,6 +968,262 @@ function Stop-AudioTrack {
     }
 }
 
+function Invoke-Ffmpeg([string[]]$Arguments) {
+    if ($null -eq $script:FfmpegPath) {
+        throw 'FFmpeg was not found. Extract the complete package, including tools\ffmpeg.exe.'
+    }
+    $output = & $script:FfmpegPath @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $message = ($output | Select-Object -Last 4 | Out-String).Trim()
+        throw "FFmpeg could not process the media. $message"
+    }
+}
+
+function Get-ChromaProcessedFile($Item) {
+    if ($null -eq $Item) { return '' }
+    if (-not $Item.ChromaEnabled) { return [string]$Item.Path }
+    $source = Get-Item -LiteralPath $Item.Path
+    $color = ([string]$Item.ChromaColor).TrimStart('#').ToUpperInvariant()
+    if ($color -notmatch '^[0-9A-F]{6}$') { throw 'The chroma-key color is invalid.' }
+    $tolerance = [Math]::Max(1, [Math]::Min(100, [int]$Item.ChromaTolerance))
+    $softness = [Math]::Max(0, [Math]::Min(100, [int]$Item.ChromaSoftness))
+    $signature = "$($source.FullName)|$($source.Length)|$($source.LastWriteTimeUtc.Ticks)|$color|$tolerance|$softness|$($Item.Kind)"
+    if ($Item.ProcessedSignature -eq $signature -and
+        (Test-Path -LiteralPath $Item.ProcessedPath -PathType Leaf)) {
+        return [string]$Item.ProcessedPath
+    }
+
+    Clear-ChromaMediaCache $Item
+    New-Item -ItemType Directory -Force -Path $script:ChromaCacheDirectory | Out-Null
+    $similarityValue = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture,
+        '{0:0.00}', $tolerance / 100.0)
+    $softnessValue = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture,
+        '{0:0.00}', $softness / 100.0)
+    $keyFilter = "colorkey=0x${color}:${similarityValue}:${softnessValue}"
+    $outputExtension = if ($Item.Kind -eq 'video') { '.mp4' } elseif ($Item.Kind -eq 'gif') { '.gif' } else { '.png' }
+    $outputPath = Join-Path $script:ChromaCacheDirectory "$($Item.Id)-$([guid]::NewGuid().ToString('N'))$outputExtension"
+
+    if ($Item.Kind -eq 'video') {
+        $filter = "[0:v]scale=960:540:force_original_aspect_ratio=decrease:force_divisible_by=2,format=rgba,$keyFilter,split=2[rgb][mask];[rgb]format=rgb24[rgb24];[mask]alphaextract,format=gray,format=rgb24[mask24];[rgb24][mask24]hstack=inputs=2,format=yuv420p[out]"
+        $arguments = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $Item.Path,
+            '-filter_complex', $filter, '-map', '[out]', '-map', '0:a?',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+            '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', $outputPath)
+    } elseif ($Item.Kind -eq 'gif') {
+        $filter = "[0:v]fps=15,scale=960:540:force_original_aspect_ratio=decrease:force_divisible_by=2,format=rgba,$keyFilter,split[keyed][palette];[palette]palettegen=reserve_transparent=1:transparency_color=ffffff[p];[keyed][p]paletteuse=alpha_threshold=16"
+        $arguments = @('-hide_banner', '-loglevel', 'error', '-y', '-ignore_loop', '1',
+            '-i', $Item.Path, '-filter_complex', $filter, '-loop', '0', $outputPath)
+    } else {
+        $filter = "format=rgba,$keyFilter"
+        $arguments = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $Item.Path,
+            '-vf', $filter, '-frames:v', '1', '-c:v', 'png', $outputPath)
+    }
+
+    try {
+        Invoke-Ffmpeg $arguments
+        if (-not (Test-Path -LiteralPath $outputPath -PathType Leaf)) {
+            throw 'FFmpeg did not create the processed media file.'
+        }
+        if ((Get-Item -LiteralPath $outputPath).Length -gt 150MB) {
+            throw 'The processed media exceeds the 150 MB transfer limit.'
+        }
+        $Item.ProcessedPath = $outputPath
+        $Item.ProcessedSignature = $signature
+        return $outputPath
+    } catch {
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Get-ScreenColor {
+    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $snapshot = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($snapshot)
+    try {
+        $graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
+    } finally {
+        $graphics.Dispose()
+    }
+
+    $picker = New-Object System.Windows.Forms.Form
+    $picker.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $picker.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $picker.Bounds = $bounds
+    $picker.BackgroundImage = $snapshot
+    $picker.BackgroundImageLayout = [System.Windows.Forms.ImageLayout]::None
+    $picker.Cursor = [System.Windows.Forms.Cursors]::Cross
+    $picker.TopMost = $true
+    $picker.KeyPreview = $true
+    $picker.ShowInTaskbar = $false
+    $picker.Add_MouseDown({
+        param($sender, $eventArgs)
+        $sender.Tag = $snapshot.GetPixel($eventArgs.X, $eventArgs.Y)
+        $sender.Close()
+    })
+    $picker.Add_KeyDown({
+        param($sender, $eventArgs)
+        if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $sender.Close() }
+    })
+    try {
+        [void]$picker.ShowDialog()
+        return $picker.Tag
+    } finally {
+        $picker.Dispose()
+        $snapshot.Dispose()
+    }
+}
+
+function Update-ChromaButton {
+    if ($null -eq $chromaButton) { return }
+    if ($null -eq $script:SelectedMediaItem) {
+        $chromaButton.Enabled = $false
+        $chromaButton.Text = 'CHROMA KEY'
+        return
+    }
+    $chromaButton.Enabled = $true
+    if ($script:SelectedMediaItem.ChromaEnabled) {
+        $chromaButton.Text = "CHROMA #$($script:SelectedMediaItem.ChromaColor)"
+        $chromaButton.BackColor = [System.Drawing.Color]::FromArgb(18, 72, 62)
+        $chromaButton.FlatAppearance.BorderColor = $script:ThemeSuccess
+    } else {
+        $chromaButton.Text = 'CHROMA KEY'
+        $chromaButton.BackColor = $script:ThemeSurfaceRaised
+        $chromaButton.FlatAppearance.BorderColor = $script:ThemeBorder
+    }
+}
+
+function Show-ChromaSettings {
+    $item = $script:SelectedMediaItem
+    if ($null -eq $item) {
+        Set-Status 'Select a media layer first.' ([System.Drawing.Color]::Firebrick)
+        return
+    }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'Chroma key'
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.ClientSize = New-Object System.Drawing.Size(410, 268)
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.ShowInTaskbar = $false
+    $dialog.BackColor = $script:ThemeBackground
+    $dialog.ForeColor = $script:ThemeText
+    $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $enabledBox = New-Object System.Windows.Forms.CheckBox
+    $enabledBox.Text = 'Remove a solid-color background'
+    $enabledBox.Location = New-Object System.Drawing.Point(18, 16)
+    $enabledBox.Size = New-Object System.Drawing.Size(365, 26)
+    $enabledBox.Checked = [bool]$item.ChromaEnabled
+    $dialog.Controls.Add($enabledBox)
+
+    $colorLabel = New-Label 'Key color' 18 55 90 24
+    $dialog.Controls.Add($colorLabel)
+    $colorPreview = New-Object System.Windows.Forms.Panel
+    $colorPreview.Location = New-Object System.Drawing.Point(112, 54)
+    $colorPreview.Size = New-Object System.Drawing.Size(54, 26)
+    $colorPreview.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $dialog.Controls.Add($colorPreview)
+    $colorText = New-Label '' 176 55 76 24
+    $colorText.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $dialog.Controls.Add($colorText)
+    $pickedColor = [System.Drawing.ColorTranslator]::FromHtml("#$($item.ChromaColor)")
+    $colorPreview.BackColor = $pickedColor
+    $colorText.Text = "#$($item.ChromaColor)"
+
+    $pickButton = New-Object System.Windows.Forms.Button
+    $pickButton.Text = 'PICK FROM SCREEN'
+    $pickButton.Location = New-Object System.Drawing.Point(258, 51)
+    $pickButton.Size = New-Object System.Drawing.Size(134, 32)
+    Style-Button $pickButton 'accent'
+    $dialog.Controls.Add($pickButton)
+
+    $toleranceLabel = New-Label 'Tolerance' 18 103 150 24
+    $dialog.Controls.Add($toleranceLabel)
+    $toleranceBox = New-Object System.Windows.Forms.NumericUpDown
+    $toleranceBox.Location = New-Object System.Drawing.Point(258, 101)
+    $toleranceBox.Size = New-Object System.Drawing.Size(134, 25)
+    $toleranceBox.Minimum = 1
+    $toleranceBox.Maximum = 100
+    $toleranceBox.Value = [Math]::Max(1, [Math]::Min(100, [int]$item.ChromaTolerance))
+    $toleranceBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+    Style-Input $toleranceBox
+    $dialog.Controls.Add($toleranceBox)
+
+    $softnessLabel = New-Label 'Edge softness' 18 143 150 24
+    $dialog.Controls.Add($softnessLabel)
+    $softnessBox = New-Object System.Windows.Forms.NumericUpDown
+    $softnessBox.Location = New-Object System.Drawing.Point(258, 141)
+    $softnessBox.Size = New-Object System.Drawing.Size(134, 25)
+    $softnessBox.Minimum = 0
+    $softnessBox.Maximum = 100
+    $softnessBox.Value = [Math]::Max(0, [Math]::Min(100, [int]$item.ChromaSoftness))
+    $softnessBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+    Style-Input $softnessBox
+    $dialog.Controls.Add($softnessBox)
+
+    $hint = New-Label 'The desktop prepares transparency before the file is sent to the TV.' 18 180 374 34
+    $hint.ForeColor = $script:ThemeMuted
+    $dialog.Controls.Add($hint)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'CANCEL'
+    $cancelButton.Location = New-Object System.Drawing.Point(188, 222)
+    $cancelButton.Size = New-Object System.Drawing.Size(98, 32)
+    Style-Button $cancelButton
+    $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.Controls.Add($cancelButton)
+    $applyButton = New-Object System.Windows.Forms.Button
+    $applyButton.Text = 'APPLY'
+    $applyButton.Location = New-Object System.Drawing.Point(294, 222)
+    $applyButton.Size = New-Object System.Drawing.Size(98, 32)
+    Style-Button $applyButton 'accent'
+    $applyButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dialog.Controls.Add($applyButton)
+    $dialog.AcceptButton = $applyButton
+    $dialog.CancelButton = $cancelButton
+
+    $pickButton.Add_Click({
+        $selectedColor = $null
+        $dialog.Opacity = 0
+        try {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 80
+            $selectedColor = Get-ScreenColor
+        } finally {
+            $dialog.Opacity = 1
+            $dialog.Activate()
+        }
+        if ($null -ne $selectedColor) {
+            $pickedColor = $selectedColor
+            $colorPreview.BackColor = $pickedColor
+            $colorText.Text = '#{0:X2}{1:X2}{2:X2}' -f $pickedColor.R, $pickedColor.G, $pickedColor.B
+            $enabledBox.Checked = $true
+        }
+    })
+
+    try {
+        if ($dialog.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        Clear-ChromaMediaCache $item
+        $item.ChromaEnabled = [bool]$enabledBox.Checked
+        $finalColor = $colorPreview.BackColor
+        $item.ChromaColor = ('{0:X2}{1:X2}{2:X2}' -f $finalColor.R, $finalColor.G, $finalColor.B)
+        $item.ChromaTolerance = [int]$toleranceBox.Value
+        $item.ChromaSoftness = [int]$softnessBox.Value
+        $item.ProcessedSignature = ''
+        Update-ChromaButton
+        if ($script:BroadcastEnabled) {
+            Send-MediaItem $item $false
+        } else {
+            Set-Status 'Chroma key configured. Enable broadcasting to process and send this layer.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+        }
+    } finally {
+        $dialog.Dispose()
+    }
+}
+
 function Send-MediaItem($Item, [bool]$Quiet = $false) {
     if ($null -eq $Item -or -not (Test-Path -LiteralPath $Item.Path -PathType Leaf)) {
         if (-not $Quiet) { Set-Status 'Select an image, GIF, or video first.' ([System.Drawing.Color]::Firebrick) }
@@ -935,6 +1244,16 @@ function Send-MediaItem($Item, [bool]$Quiet = $false) {
     $hadAudioSession = $script:AudioSessionActive
     try {
         if ($Item -eq $script:SelectedMediaItem) { Reset-MoveStream }
+        $transferPath = [string]$Item.Path
+        if ($Item.ChromaEnabled) {
+            if (-not $Quiet) { Set-Status 'Preparing chroma-key transparency on the desktop.' ([System.Drawing.Color]::FromArgb(70, 78, 92)) }
+            $transferPath = Get-ChromaProcessedFile $Item
+        }
+        $transferInfo = Get-Item -LiteralPath $transferPath
+        $transferMaximumBytes = if ($Item.Kind -eq 'image') { 12MB } else { 150MB }
+        if ($transferInfo.Length -gt $transferMaximumBytes) {
+            throw "The processed file is too large. Maximum size: $([Math]::Round($transferMaximumBytes / 1MB)) MB."
+        }
         Open-AdbTunnel
         Ensure-TVReceiver
         Configure-TVVSync
@@ -943,17 +1262,18 @@ function Send-MediaItem($Item, [bool]$Quiet = $false) {
         $y = [Math]::Round([double]$Item.Y * 1000)
         $width = [int]$Item.Size * 10
         $opacity = [int]$Item.Opacity
-        $extension = [System.IO.Path]::GetExtension($Item.Path).TrimStart('.').ToLowerInvariant()
+        $extension = [System.IO.Path]::GetExtension($transferPath).TrimStart('.').ToLowerInvariant()
         $aspect = [Math]::Round([double]$Item.Aspect * 1000)
         if ($Item.Kind -eq 'gif') {
             $path = "/show-media?id=$($Item.Id)&type=gif&ext=gif&x=$x&y=$y&w=$width&opacity=$opacity&aspect=$aspect"
         } elseif ($Item.Kind -eq 'video') {
             $videoMutedValue = if ($Item.VideoMuted) { 1 } else { 0 }
-            $path = "/show-media?id=$($Item.Id)&type=video&ext=$extension&x=$x&y=$y&w=$width&opacity=$opacity&aspect=$aspect&videoMuted=$videoMutedValue"
+            $alphaPackedValue = if ($Item.ChromaEnabled) { 1 } else { 0 }
+            $path = "/show-media?id=$($Item.Id)&type=video&ext=$extension&x=$x&y=$y&w=$width&opacity=$opacity&aspect=$aspect&videoMuted=$videoMutedValue&alphaPacked=$alphaPackedValue"
         } else {
             $path = "/show?id=$($Item.Id)&x=$x&y=$y&w=$width&opacity=$opacity"
         }
-        Send-FileRequest $path $Item.Path | Out-Null
+        Send-FileRequest $path $transferPath | Out-Null
         $Item.RemoteVisible = $true
         $script:Connected = $true
         $script:OverlayActive = $true
@@ -1132,17 +1452,24 @@ $mediaToolbar = New-CardPanel 25 82 693 40
 $form.Controls.Add($mediaToolbar)
 $fileBox = New-Object System.Windows.Forms.TextBox
 $fileBox.Location = New-Object System.Drawing.Point(10, 8)
-$fileBox.Size = New-Object System.Drawing.Size(525, 24)
+$fileBox.Size = New-Object System.Drawing.Size(375, 24)
 $fileBox.ReadOnly = $true
 $fileBox.Text = 'No media selected'
 Style-Input $fileBox
 $mediaToolbar.Controls.Add($fileBox)
 $browseButton = New-Object System.Windows.Forms.Button
-$browseButton.Text = '+  ADD MEDIA'
-$browseButton.Location = New-Object System.Drawing.Point(543, 5)
-$browseButton.Size = New-Object System.Drawing.Size(140, 30)
+$browseButton.Text = 'ADD MEDIA'
+$browseButton.Location = New-Object System.Drawing.Point(393, 5)
+$browseButton.Size = New-Object System.Drawing.Size(132, 30)
 Style-Button $browseButton 'accent'
 $mediaToolbar.Controls.Add($browseButton)
+$chromaButton = New-Object System.Windows.Forms.Button
+$chromaButton.Text = 'CHROMA KEY'
+$chromaButton.Location = New-Object System.Drawing.Point(533, 5)
+$chromaButton.Size = New-Object System.Drawing.Size(150, 30)
+Style-Button $chromaButton
+$mediaToolbar.Controls.Add($chromaButton)
+Update-ChromaButton
 
 $screenPreview = New-Object System.Windows.Forms.Panel
 $screenPreview.Location = New-Object System.Drawing.Point(25, 132)
@@ -1335,7 +1662,7 @@ $audioSubtitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7)
 $audioSubtitle.ForeColor = $script:ThemeMuted
 $audioPanel.Controls.Add($audioSubtitle)
 $addAudioButton = New-Object System.Windows.Forms.Button
-$addAudioButton.Text = '+  ADD AUDIO'
+$addAudioButton.Text = 'ADD AUDIO'
 $addAudioButton.Location = New-Object System.Drawing.Point(14, 72)
 $addAudioButton.Size = New-Object System.Drawing.Size(254, 38)
 Style-Button $addAudioButton 'accent'
@@ -1664,6 +1991,7 @@ $topRightButton.Add_Click({ Move-Preset 'right' 'top' })
 $centerButton.Add_Click({ Move-Preset 'center' 'center' })
 $bottomLeftButton.Add_Click({ Move-Preset 'left' 'bottom' })
 $bottomRightButton.Add_Click({ Move-Preset 'right' 'bottom' })
+$chromaButton.Add_Click({ Show-ChromaSettings })
 
 $browseButton.Add_Click({
     $dialog = New-Object System.Windows.Forms.OpenFileDialog
@@ -1843,6 +2171,7 @@ $form.Add_FormClosing({
     $http.Dispose()
     foreach ($item in @($script:MediaItems)) {
         if ($null -ne $item.Image) { $item.Image.Dispose() }
+        Clear-ChromaMediaCache $item
     }
 })
 
@@ -2055,6 +2384,23 @@ if ($env:MIRROR_TO_TV_SELFTEST -eq '1') {
     if ([string]::IsNullOrWhiteSpace($selfTestImagePath)) { throw 'SELFTEST_IMAGE_NOT_FOUND' }
     $fileBox.Text = $selfTestImagePath
     Load-SelectedMedia $selfTestImagePath
+    if ($env:MIRROR_TO_TV_CHROMA_TEST -eq '1') {
+        $script:SelectedMediaItem.ChromaEnabled = $true
+        if ($env:MIRROR_TO_TV_CHROMA_COLOR -match '^[0-9a-fA-F]{6}$') {
+            $script:SelectedMediaItem.ChromaColor = $env:MIRROR_TO_TV_CHROMA_COLOR.ToUpperInvariant()
+        }
+        $processedTestPath = Get-ChromaProcessedFile $script:SelectedMediaItem
+        if (-not (Test-Path -LiteralPath $processedTestPath -PathType Leaf)) {
+            throw 'CHROMA_PROCESSING_FAILED'
+        }
+        $expectedExtension = if ($script:MediaKind -eq 'video') { '.mp4' } elseif ($script:MediaKind -eq 'gif') { '.gif' } else { '.png' }
+        if ([System.IO.Path]::GetExtension($processedTestPath) -ne $expectedExtension) {
+            throw "CHROMA_EXTENSION_FAILED expected=$expectedExtension actual=$([System.IO.Path]::GetExtension($processedTestPath))"
+        }
+        Write-Output "CHROMA_PROCESSING_OK kind=$($script:MediaKind) bytes=$((Get-Item -LiteralPath $processedTestPath).Length)"
+        Clear-ChromaMediaCache $script:SelectedMediaItem
+        $script:SelectedMediaItem.ChromaEnabled = $false
+    }
     Clamp-OverlayPosition
     $testRectangle = Get-OverlayRectangle
     $dragResult = 'not-run'

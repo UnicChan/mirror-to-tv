@@ -1,6 +1,7 @@
 param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$AndroidSdk = $(if ($env:ANDROID_HOME) { $env:ANDROID_HOME } elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }),
+    [string]$FfmpegPath = $env:MIRROR_TO_TV_FFMPEG,
     [string]$KeystorePath = $env:MIRROR_TO_TV_KEYSTORE,
     [string]$KeystoreAlias = $(if ($env:MIRROR_TO_TV_KEYSTORE_ALIAS) { $env:MIRROR_TO_TV_KEYSTORE_ALIAS } else { 'mirror-to-tv' })
 )
@@ -22,6 +23,8 @@ $clientTemplate = Join-Path $repoRoot 'desktop\Mirror-To-TV.ps1.template'
 $output = Join-Path $repoRoot 'dist'
 $build = Join-Path $repoRoot 'build'
 $privateDirectory = Join-Path $repoRoot '.private'
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 $tokenWasGenerated = [string]::IsNullOrWhiteSpace($Token)
 if ($tokenWasGenerated) { $Token = New-SecureHex 32 }
@@ -38,6 +41,36 @@ if ([string]::IsNullOrWhiteSpace($JavaHome)) {
 if ([string]::IsNullOrWhiteSpace($JavaHome) -or
     -not (Test-Path -LiteralPath (Join-Path $JavaHome 'bin\javac.exe'))) {
     throw 'JDK 17 was not found. Set JAVA_HOME or pass -JavaHome.'
+}
+
+function Get-Sha256Hex([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return -join ($algorithm.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $algorithm.Dispose()
+        $stream.Dispose()
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($FfmpegPath)) {
+    $ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($null -ne $ffmpegCommand) { $FfmpegPath = $ffmpegCommand.Source }
+}
+if ([string]::IsNullOrWhiteSpace($FfmpegPath) -or
+    -not (Test-Path -LiteralPath $FfmpegPath -PathType Leaf)) {
+    throw 'ffmpeg.exe was not found. Pass -FfmpegPath or set MIRROR_TO_TV_FFMPEG.'
+}
+$ffmpegDirectory = Split-Path -Parent $FfmpegPath
+$ffmpegLicense = @(
+    Join-Path $ffmpegDirectory 'LICENSE'
+    Join-Path (Split-Path -Parent $ffmpegDirectory) 'LICENSE'
+    Join-Path $ffmpegDirectory 'COPYING.GPLv3'
+    Join-Path (Split-Path -Parent $ffmpegDirectory) 'COPYING.GPLv3'
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($null -eq $ffmpegLicense) {
+    throw 'The FFmpeg license file was not found next to ffmpeg.exe.'
 }
 
 if (-not (Test-Path -LiteralPath $AndroidSdk -PathType Container)) {
@@ -72,15 +105,15 @@ New-Item -ItemType Directory -Force -Path $generatedSource, $classes, $dex, $out
 
 $configTemplate = Join-Path $project 'src\local\lanoverlay\tv\Config.java.template'
 $generatedConfig = Join-Path $generatedSource 'Config.java'
-$configText = (Get-Content -Raw -LiteralPath $configTemplate).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
+$configText = ([IO.File]::ReadAllText($configTemplate, [Text.Encoding]::UTF8)).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
 if ($configText -match '__MIRROR_TO_TV_TOKEN__') { throw 'Could not inject the receiver token.' }
-Set-Content -LiteralPath $generatedConfig -Value $configText -Encoding utf8
+[IO.File]::WriteAllText($generatedConfig, $configText, $utf8NoBom)
 
 $generatedClient = Join-Path $build 'generated-client\Mirror-To-TV.ps1'
 New-Item -ItemType Directory -Force -Path (Split-Path $generatedClient -Parent) | Out-Null
-$clientText = (Get-Content -Raw -LiteralPath $clientTemplate).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
+$clientText = ([IO.File]::ReadAllText($clientTemplate, [Text.Encoding]::UTF8)).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
 if ($clientText -match '__MIRROR_TO_TV_TOKEN__') { throw 'Could not inject the desktop token.' }
-Set-Content -LiteralPath $generatedClient -Value $clientText -Encoding utf8
+[IO.File]::WriteAllText($generatedClient, $clientText, $utf8Bom)
 
 $javaBin = Join-Path $JavaHome 'bin'
 $env:JAVA_HOME = $JavaHome
@@ -119,8 +152,14 @@ $sources = @(
     Get-ChildItem -LiteralPath (Join-Path $project 'src') -Filter '*.java' -Recurse
     Get-Item -LiteralPath $generatedConfig
 ) | ForEach-Object { $_.FullName }
-$javacOutput = & $javac -encoding UTF-8 -source 8 -target 8 -bootclasspath $androidJar -d $classes $sources 2>&1
-$javacExitCode = $LASTEXITCODE
+$savedErrorActionPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = 'Continue'
+    $javacOutput = & $javac -encoding UTF-8 -source 8 -target 8 -bootclasspath $androidJar -d $classes $sources 2>&1
+    $javacExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+}
 $javacText = ($javacOutput | Out-String).Trim()
 if ($javacExitCode -ne 0) { throw "javac failed.`n$javacText" }
 if ($javacText -and ($javacText -notmatch 'java\.nio\.file\.AccessDeniedException: .*android\.jar')) {
@@ -223,12 +262,14 @@ foreach ($toolName in 'adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'NOTICE.tx
     }
     Copy-Item -LiteralPath $toolPath -Destination $releaseTools
 }
+Copy-Item -LiteralPath $FfmpegPath -Destination (Join-Path $releaseTools 'ffmpeg.exe')
+Copy-Item -LiteralPath $ffmpegLicense -Destination (Join-Path $releaseTools 'FFMPEG-LICENSE.txt')
 
 $checksumLines = Get-ChildItem -LiteralPath $releaseDirectory -Recurse -File |
     Sort-Object FullName |
     ForEach-Object {
         $relative = $_.FullName.Substring($releaseDirectory.Length + 1).Replace('\', '/')
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+        $hash = Get-Sha256Hex $_.FullName
         "$hash  $relative"
     }
 Set-Content -LiteralPath (Join-Path $releaseDirectory 'SHA256SUMS.txt') -Value $checksumLines -Encoding utf8
@@ -239,8 +280,8 @@ Compress-Archive -LiteralPath $releaseDirectory -DestinationPath $releaseArchive
     Apk = Join-Path $releaseDirectory 'Mirror-To-TV.apk'
     Desktop = Join-Path $releaseDirectory 'Mirror-To-TV.ps1'
     Archive = $releaseArchive
-    ApkSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $finalApk).Hash.ToLowerInvariant()
-    DesktopSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $generatedClient).Hash.ToLowerInvariant()
+    ApkSha256 = Get-Sha256Hex $finalApk
+    DesktopSha256 = Get-Sha256Hex $generatedClient
     TokenGenerated = $tokenWasGenerated
     SigningMode = $(if ($usingExternalKeystore) { 'external' } else { 'local-development' })
 }

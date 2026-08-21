@@ -8,6 +8,12 @@ set "TVIP=%~1"
 set "TVPORT=%~2"
 set "EXIT_CODE=1"
 
+set "MIRROR_TO_TV_INSTALL_CONFIG=%~dp0mirror-to-tv.config.json"
+if not defined TVIP if exist "%MIRROR_TO_TV_INSTALL_CONFIG%" for /f "tokens=1,* delims==" %%A in ('powershell.exe -NoProfile -Command "try { $config = ConvertFrom-Json (Get-Content -Raw -LiteralPath $env:MIRROR_TO_TV_INSTALL_CONFIG); 'TVIP=' + $config.tvIp; 'TVPORT=' + $config.adbPort } catch {}"') do (
+  if /i "%%A"=="TVIP" set "TVIP=%%B"
+  if /i "%%A"=="TVPORT" set "TVPORT=%%B"
+)
+
 echo.
 echo mirror-to-tv 1.0 installer
 echo ==========================
@@ -53,12 +59,47 @@ if errorlevel 1 (
 )
 
 echo Installing the receiver...
-"%ADB%" -s "%SERIAL%" install -r "%APK%"
-if errorlevel 1 (
-  echo ERROR: APK installation failed.
-  echo If another build is installed with a different signature, uninstall it manually first.
+set "INSTALL_LOG=%TEMP%\mirror-to-tv-install-%RANDOM%-%RANDOM%.log"
+"%ADB%" -s "%SERIAL%" install -r "%APK%" >"!INSTALL_LOG!" 2>&1
+set "INSTALL_RESULT=!ERRORLEVEL!"
+type "!INSTALL_LOG!"
+if "!INSTALL_RESULT!"=="0" (
+  del /q "!INSTALL_LOG!" >nul 2>&1
+  goto install_complete
+)
+
+findstr /c:"INSTALL_FAILED_UPDATE_INCOMPATIBLE" "!INSTALL_LOG!" >nul
+if not errorlevel 1 goto signature_mismatch
+del /q "!INSTALL_LOG!" >nul 2>&1
+echo ERROR: APK installation failed.
+goto disconnect
+
+:signature_mismatch
+del /q "!INSTALL_LOG!" >nul 2>&1
+echo.
+choice /c YN /n /m "The installed app has a different signature. Completely reinstall the app? This removes its existing app data. [Y/N] "
+if errorlevel 2 (
+  echo Installation cancelled. The installed app was not changed.
+  set "EXIT_CODE=2"
+  set "MIRROR_TO_TV_NO_PAUSE=1"
   goto disconnect
 )
+
+echo Removing the installed app...
+"%ADB%" -s "%SERIAL%" uninstall local.lanoverlay.tv
+if errorlevel 1 (
+  echo ERROR: The installed app could not be removed.
+  goto disconnect
+)
+
+echo Installing the fresh receiver...
+"%ADB%" -s "%SERIAL%" install "%APK%"
+if errorlevel 1 (
+  echo ERROR: The old app was removed, but the fresh APK installation failed.
+  goto disconnect
+)
+
+:install_complete
 
 echo Granting permission to display over other apps...
 "%ADB%" -s "%SERIAL%" shell appops set local.lanoverlay.tv SYSTEM_ALERT_WINDOW allow
@@ -66,6 +107,9 @@ if errorlevel 1 (
   echo ERROR: The overlay permission could not be granted.
   goto disconnect
 )
+
+powershell.exe -NoProfile -Command "$windowState = (& $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell dumpsys window windows | Out-String); $activityState = (& $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell dumpsys activity activities | Out-String); $foreground = ([regex]::Matches($windowState + $activityState, '(?im)^.*(?:mCurrentFocus|mFocusedApp|mResumedActivity|topResumedActivity).*$').Value -join ' '); if ($foreground -match '(?i)(settings|permissioncontroller|drawoverlay|manageoverlay|displayover)') { & $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell input keyevent KEYCODE_BACK | Out-Null; exit $LASTEXITCODE }; exit 0"
+if errorlevel 1 echo WARNING: The TV permission screen could not be closed automatically.
 
 echo Starting the TV receiver...
 "%ADB%" -s "%SERIAL%" shell am broadcast -a local.lanoverlay.tv.START -n local.lanoverlay.tv/.BootReceiver >nul

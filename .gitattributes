@@ -5,6 +5,8 @@
 *.xml text eol=lf
 *.template text eol=lf
 *.png binary
+*.gif binary
+*.webm binary
 *.dll binary
 *.exe binary
 *.apk binary

@@ -392,8 +392,8 @@ public final class OverlayService extends Service {
                     @Override
                     public void run() {
                         OverlayEntry entry = overlays.get(mediaId);
-                        if (entry != null && entry.view instanceof OverlayVideoView) {
-                            ((OverlayVideoView) entry.view).startPlayback();
+                        if (entry != null && entry.view instanceof OverlayVideoPlayer) {
+                            ((OverlayVideoPlayer) entry.view).startPlayback();
                         }
                     }
                 });
@@ -407,8 +407,8 @@ public final class OverlayService extends Service {
                     @Override
                     public void run() {
                         OverlayEntry entry = overlays.get(mediaId);
-                        if (entry != null && entry.view instanceof OverlayVideoView) {
-                            ((OverlayVideoView) entry.view).pausePlayback();
+                        if (entry != null && entry.view instanceof OverlayVideoPlayer) {
+                            ((OverlayVideoPlayer) entry.view).pausePlayback();
                         }
                     }
                 });
@@ -634,6 +634,7 @@ public final class OverlayService extends Service {
         final int widthPermille = clamp(safeInt(query.get("w"), 250), 10, 1000);
         final int opacity = clamp(safeInt(query.get("opacity"), 100), 0, 100);
         final boolean requestedVideoMuted = queryBoolean(query.get("videoMuted"));
+        final boolean alphaPacked = queryBoolean(query.get("alphaPacked"));
         final String mediaId = allowedMediaId(query.get("id"));
         lastHeartbeat = SystemClock.elapsedRealtime();
         boolean displayed = runOnMainAndWait(new Runnable() {
@@ -644,7 +645,7 @@ public final class OverlayService extends Service {
                             widthPermille, opacity);
                 } else {
                     showVideoOverlay(mediaId, mediaFile, aspect, xPermille, yPermille,
-                            widthPermille, opacity, requestedVideoMuted);
+                            widthPermille, opacity, requestedVideoMuted, alphaPacked);
                 }
             }
         });
@@ -798,11 +799,11 @@ public final class OverlayService extends Service {
 
     private void setVideoMuted(String mediaId, boolean muted) {
         OverlayEntry entry = overlays.get(mediaId);
-        if (entry == null || !(entry.view instanceof OverlayVideoView)) {
+        if (entry == null || !(entry.view instanceof OverlayVideoPlayer)) {
             return;
         }
         entry.videoMuted = muted;
-        ((OverlayVideoView) entry.view).setMuted(globalMuted || muted);
+        ((OverlayVideoPlayer) entry.view).setMuted(globalMuted || muted);
         if (mediaId.equals(currentMediaId)) {
             videoMuted = muted;
         }
@@ -810,8 +811,8 @@ public final class OverlayService extends Service {
 
     private void applyVideoVolume() {
         for (OverlayEntry entry : overlays.values()) {
-            if (entry.view instanceof OverlayVideoView) {
-                ((OverlayVideoView) entry.view).setMuted(globalMuted || entry.videoMuted);
+            if (entry.view instanceof OverlayVideoPlayer) {
+                ((OverlayVideoPlayer) entry.view).setMuted(globalMuted || entry.videoMuted);
             }
         }
     }
@@ -819,7 +820,7 @@ public final class OverlayService extends Service {
     private int countVideoOverlays() {
         int count = 0;
         for (OverlayEntry entry : overlays.values()) {
-            if (entry.view instanceof OverlayVideoView) {
+            if (entry.view instanceof OverlayVideoPlayer) {
                 count++;
             }
         }
@@ -829,7 +830,7 @@ public final class OverlayService extends Service {
     private int countMutedVideoOverlays() {
         int count = 0;
         for (OverlayEntry entry : overlays.values()) {
-            if (entry.view instanceof OverlayVideoView && entry.videoMuted) {
+            if (entry.view instanceof OverlayVideoPlayer && entry.videoMuted) {
                 count++;
             }
         }
@@ -907,11 +908,10 @@ public final class OverlayService extends Service {
 
     private void showVideoOverlay(final String mediaId, final File mediaFile, float aspect,
                                   int xPermille, int yPermille, int widthPermille, int opacity,
-                                  final boolean requestedVideoMuted) {
-        final OverlayVideoView[] videoHolder = new OverlayVideoView[1];
-        videoHolder[0] = new OverlayVideoView(this, mediaFile.getAbsolutePath(),
-                globalMuted || requestedVideoMuted,
-                new OverlayVideoView.AspectListener() {
+                                  final boolean requestedVideoMuted,
+                                  boolean alphaPacked) {
+        final View[] videoHolder = new View[1];
+        OverlayVideoView.AspectListener listener = new OverlayVideoView.AspectListener() {
             @Override
             public void onVideoAspect(float videoAspect) {
                 OverlayEntry entry = overlays.get(mediaId);
@@ -920,7 +920,14 @@ public final class OverlayService extends Service {
                     moveEntry(entry, entry.x, entry.y, entry.width, entry.opacity);
                 }
             }
-        });
+        };
+        if (alphaPacked) {
+            videoHolder[0] = new PackedAlphaVideoView(this, mediaFile.getAbsolutePath(),
+                    globalMuted || requestedVideoMuted, listener);
+        } else {
+            videoHolder[0] = new OverlayVideoView(this, mediaFile.getAbsolutePath(),
+                    globalMuted || requestedVideoMuted, listener);
+        }
         addOverlayView(mediaId, videoHolder[0], aspect, mediaFile, null, "video",
                 requestedVideoMuted,
                 xPermille, yPermille, widthPermille, opacity);
@@ -1149,9 +1156,9 @@ public final class OverlayService extends Service {
         if (entry == null) {
             return;
         }
-        if (entry.view instanceof OverlayVideoView) {
+        if (entry.view instanceof OverlayVideoPlayer) {
             try {
-                ((OverlayVideoView) entry.view).releasePlayer();
+                ((OverlayVideoPlayer) entry.view).releasePlayer();
             } catch (RuntimeException ignored) { }
         }
         try {
