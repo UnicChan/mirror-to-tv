@@ -1,6 +1,7 @@
 param(
     [string]$JavaHome = $env:JAVA_HOME,
     [string]$AndroidSdk = $(if ($env:ANDROID_HOME) { $env:ANDROID_HOME } elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }),
+    [string]$FfmpegPath = $env:MIRROR_TO_TV_FFMPEG,
     [string]$KeystorePath = $env:MIRROR_TO_TV_KEYSTORE,
     [string]$KeystoreAlias = $(if ($env:MIRROR_TO_TV_KEYSTORE_ALIAS) { $env:MIRROR_TO_TV_KEYSTORE_ALIAS } else { 'mirror-to-tv' })
 )
@@ -38,6 +39,25 @@ if ([string]::IsNullOrWhiteSpace($JavaHome)) {
 if ([string]::IsNullOrWhiteSpace($JavaHome) -or
     -not (Test-Path -LiteralPath (Join-Path $JavaHome 'bin\javac.exe'))) {
     throw 'JDK 17 was not found. Set JAVA_HOME or pass -JavaHome.'
+}
+
+if ([string]::IsNullOrWhiteSpace($FfmpegPath)) {
+    $ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+    if ($null -ne $ffmpegCommand) { $FfmpegPath = $ffmpegCommand.Source }
+}
+if ([string]::IsNullOrWhiteSpace($FfmpegPath) -or
+    -not (Test-Path -LiteralPath $FfmpegPath -PathType Leaf)) {
+    throw 'ffmpeg.exe was not found. Pass -FfmpegPath or set MIRROR_TO_TV_FFMPEG.'
+}
+$ffmpegDirectory = Split-Path -Parent $FfmpegPath
+$ffmpegLicense = @(
+    Join-Path $ffmpegDirectory 'LICENSE'
+    Join-Path (Split-Path -Parent $ffmpegDirectory) 'LICENSE'
+    Join-Path $ffmpegDirectory 'COPYING.GPLv3'
+    Join-Path (Split-Path -Parent $ffmpegDirectory) 'COPYING.GPLv3'
+) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($null -eq $ffmpegLicense) {
+    throw 'The FFmpeg license file was not found next to ffmpeg.exe.'
 }
 
 if (-not (Test-Path -LiteralPath $AndroidSdk -PathType Container)) {
@@ -223,6 +243,8 @@ foreach ($toolName in 'adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll', 'NOTICE.tx
     }
     Copy-Item -LiteralPath $toolPath -Destination $releaseTools
 }
+Copy-Item -LiteralPath $FfmpegPath -Destination (Join-Path $releaseTools 'ffmpeg.exe')
+Copy-Item -LiteralPath $ffmpegLicense -Destination (Join-Path $releaseTools 'FFMPEG-LICENSE.txt')
 
 $checksumLines = Get-ChildItem -LiteralPath $releaseDirectory -Recurse -File |
     Sort-Object FullName |

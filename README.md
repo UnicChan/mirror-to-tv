@@ -51,6 +51,15 @@ The installer connects to the TV, installs the APK, grants the overlay permissio
 
 ADB is included in the release archive; Android Studio is not required. Its Apache 2.0 notices are included in `tools/NOTICE.txt`. If the connection fails, confirm that both devices are on the same non-guest network and that the router does not isolate Wi-Fi clients.
 
+## Chroma key transparency
+
+1. Add an image, animated GIF, or video and select its layer in the preview.
+2. Open **CHROMA KEY** and enable solid-color background removal. The default key is `#00FF00`.
+3. For a different shade, choose **PICK FROM SCREEN**, then click the required color anywhere across the Windows desktop. Adjust tolerance and edge softness only when needed.
+4. Enable broadcasting. The first send may take longer while the desktop prepares transparency; the result is cached until the source or chroma-key settings change.
+
+Images and GIFs are converted to transparent media on the PC. Videos are converted on the PC to an H.264 stream containing the finished color image and alpha mask. The TV uses hardware video decoding and a small GPU shader only to apply that precomputed mask. FFmpeg is included in the release archive, is not installed on the TV, and its license is in `tools/FFMPEG-LICENSE.txt`.
+
 ## License
 
 The source code is distributed under the [MIT License](LICENSE).

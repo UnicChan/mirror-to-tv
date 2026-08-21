@@ -10,7 +10,8 @@ import android.view.TextureView;
 import java.io.IOException;
 
 /** Video renderer backed by TextureView so it behaves like a normal movable overlay layer. */
-final class OverlayVideoView extends TextureView implements TextureView.SurfaceTextureListener {
+final class OverlayVideoView extends TextureView implements TextureView.SurfaceTextureListener,
+        OverlayVideoPlayer {
     interface AspectListener {
         void onVideoAspect(float aspect);
     }
@@ -33,21 +34,21 @@ final class OverlayVideoView extends TextureView implements TextureView.SurfaceT
         setSurfaceTextureListener(this);
     }
 
-    void startPlayback() {
+    public void startPlayback() {
         playWhenReady = true;
         if (player != null) {
             player.start();
         }
     }
 
-    void pausePlayback() {
+    public void pausePlayback() {
         playWhenReady = false;
         if (player != null && player.isPlaying()) {
             player.pause();
         }
     }
 
-    void setMuted(boolean muted) {
+    public void setMuted(boolean muted) {
         this.muted = muted;
         if (player != null) {
             float volume = muted ? 0f : 1f;
@@ -55,7 +56,7 @@ final class OverlayVideoView extends TextureView implements TextureView.SurfaceT
         }
     }
 
-    void releasePlayer() {
+    public void releasePlayer() {
         if (player != null) {
             try {
                 player.stop();
