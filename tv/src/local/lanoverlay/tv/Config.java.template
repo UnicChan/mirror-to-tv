@@ -1,0 +1,11 @@
+package local.lanoverlay.tv;
+
+final class Config {
+    static final int PORT = 8765;
+    static final String TOKEN = "__MIRROR_TO_TV_TOKEN__";
+    static final long HEARTBEAT_TIMEOUT_MS = 30_000L;
+    static final int MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+    static final int MAX_MEDIA_BYTES = 150 * 1024 * 1024;
+
+    private Config() { }
+}

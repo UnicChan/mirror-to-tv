@@ -1,0 +1,2221 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Net.Http
+
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Restrained sci-fi palette: deep navy surfaces, cool cyan focus and one warm danger color.
+$script:ThemeBackground = [System.Drawing.Color]::FromArgb(8, 12, 20)
+$script:ThemeSurface = [System.Drawing.Color]::FromArgb(15, 22, 35)
+$script:ThemeSurfaceRaised = [System.Drawing.Color]::FromArgb(20, 30, 47)
+$script:ThemeBorder = [System.Drawing.Color]::FromArgb(42, 59, 82)
+$script:ThemeText = [System.Drawing.Color]::FromArgb(233, 242, 255)
+$script:ThemeMuted = [System.Drawing.Color]::FromArgb(126, 145, 171)
+$script:ThemeAccent = [System.Drawing.Color]::FromArgb(62, 211, 238)
+$script:ThemeAccentDark = [System.Drawing.Color]::FromArgb(21, 103, 126)
+$script:ThemeSuccess = [System.Drawing.Color]::FromArgb(53, 214, 156)
+$script:ThemeWarning = [System.Drawing.Color]::FromArgb(245, 173, 72)
+$script:ThemeDanger = [System.Drawing.Color]::FromArgb(244, 76, 106)
+
+$script:Token = '__MIRROR_TO_TV_TOKEN__'
+$script:ReceiverPort = 8765
+$script:LocalTunnelPort = 18765
+$script:ConfigPath = Join-Path $PSScriptRoot 'mirror-to-tv.config.json'
+$script:Connected = $false
+$script:OverlayActive = $false
+$script:AudioSessionActive = $false
+$script:TunnelOpen = $false
+$script:Closing = $false
+$script:CurrentImage = $null
+$script:MediaItems = New-Object System.Collections.ArrayList
+$script:SelectedMediaItem = $null
+$script:NextMediaId = 1
+$script:BroadcastEnabled = $false
+$script:ChangingSelection = $false
+$script:ImageAspect = 1.0
+$script:MediaKind = 'image'
+$script:LoadedMediaPath = ''
+$script:VideoMuted = $false
+$script:GlobalMuted = $false
+$script:AudioLibrary = New-Object System.Collections.ArrayList
+$script:CurrentAudioPath = ''
+$script:PositionDirty = $false
+$script:DropModeEnabled = $false
+$script:VSyncEnabled = $false
+$script:VSyncIntervalMs = 500
+$script:VSyncTransitionMs = 500
+$script:VideoPaused = $false
+$script:MoveFailures = 0
+$script:PositionRevision = 0L
+$script:MoveSentRevision = 0L
+$script:MoveTask = $null
+$script:MoveRequest = $null
+$script:MoveNextAllowedAt = 0L
+$script:ForceMovePending = $false
+$script:MoveRequestsStarted = 0
+$script:MoveRequestsSucceeded = 0
+$script:MoveClock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:OverlayX = 0.72
+$script:OverlayY = 0.04
+$script:Dragging = $false
+$script:DragOffset = [System.Drawing.PointF]::new([single]0, [single]0)
+$script:Resizing = $false
+$script:ResizeCorner = ''
+$script:ResizeAnchor = [System.Drawing.PointF]::new([single]0, [single]0)
+$script:OverlaySize = 25
+
+$http = New-Object System.Net.Http.HttpClient
+$http.Timeout = [TimeSpan]::FromMinutes(10)
+$http.DefaultRequestHeaders.ExpectContinue = $false
+$http.DefaultRequestHeaders.Add('X-Overlay-Token', $script:Token)
+
+# Position updates use their own short-timeout client. They are sent asynchronously,
+# so a slow Wi-Fi packet can never freeze mouse dragging in the WinForms UI.
+$moveHttp = New-Object System.Net.Http.HttpClient
+$moveHttp.Timeout = [TimeSpan]::FromSeconds(3)
+$moveHttp.DefaultRequestHeaders.ExpectContinue = $false
+$moveHttp.DefaultRequestHeaders.Add('X-Overlay-Token', $script:Token)
+
+function Find-Adb {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add((Join-Path $PSScriptRoot 'tools\adb.exe'))
+    foreach ($sdkRoot in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT)) {
+        if (-not [string]::IsNullOrWhiteSpace($sdkRoot)) {
+            $candidates.Add((Join-Path $sdkRoot 'platform-tools\adb.exe'))
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $candidates.Add((Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'))
+    }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    $command = Get-Command adb.exe -ErrorAction SilentlyContinue
+    if ($null -ne $command) { return $command.Source }
+    return $null
+}
+
+$script:AdbPath = Find-Adb
+
+function New-Label([string]$Text, [int]$X, [int]$Y, [int]$Width, [int]$Height = 24) {
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Text
+    $label.Location = New-Object System.Drawing.Point($X, $Y)
+    $label.Size = New-Object System.Drawing.Size($Width, $Height)
+    $label.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $label.ForeColor = $script:ThemeText
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    return $label
+}
+
+function Set-Status([string]$Text, [System.Drawing.Color]$Color) {
+    $statusLabel.Text = $Text
+    if ($Color -eq [System.Drawing.Color]::Firebrick) {
+        $statusColor = $script:ThemeDanger
+    } elseif ($Color.R -gt 130 -and $Color.G -lt 135) {
+        $statusColor = $script:ThemeWarning
+    } elseif ($Color.G -gt $Color.R) {
+        $statusColor = $script:ThemeSuccess
+    } else {
+        $statusColor = $script:ThemeMuted
+    }
+    $statusLabel.ForeColor = $statusColor
+    if ($null -ne $statusSignal) { $statusSignal.BackColor = $statusColor }
+    $statusLabel.Refresh()
+    if ($null -ne $statusSignal) { $statusSignal.Refresh() }
+}
+
+function Get-TVSerial {
+    $address = $ipBox.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($address)) { throw 'Enter the TV IP address.' }
+    return "${address}:$([int]$adbPortBox.Value)"
+}
+
+function Open-AdbTunnel {
+    if ($null -eq $script:AdbPath) {
+        throw 'adb.exe was not found. Extract the complete package, including the tools folder.'
+    }
+    if ($script:TunnelOpen) { return }
+    $serial = Get-TVSerial
+    $connectOutput = & $script:AdbPath connect $serial 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "ADB connection failed: $connectOutput" }
+    $state = (& $script:AdbPath -s $serial get-state 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $state -ne 'device') {
+        throw 'The TV rejected the ADB connection. Check the address and network debugging settings.'
+    }
+    $forwardOutput = & $script:AdbPath -s $serial forward "tcp:$script:LocalTunnelPort" "tcp:$script:ReceiverPort" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Could not open the ADB tunnel: $forwardOutput" }
+    $script:TunnelOpen = $true
+}
+
+function Close-AdbTunnel {
+    if ($null -eq $script:AdbPath) { return }
+    try {
+        $serial = Get-TVSerial
+        & $script:AdbPath -s $serial forward --remove "tcp:$script:LocalTunnelPort" 2>&1 | Out-Null
+        & $script:AdbPath disconnect $serial 2>&1 | Out-Null
+    } catch { }
+    $script:TunnelOpen = $false
+}
+
+function Send-Request([string]$Method, [string]$Path, [byte[]]$Body = $null) {
+    $url = "http://127.0.0.1:$script:LocalTunnelPort$Path"
+    $content = $null
+    $response = $null
+    try {
+        if ($null -ne $Body) {
+            $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,$Body)
+            $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+        }
+        if ($Method -eq 'GET') {
+            $response = $http.GetAsync($url).GetAwaiter().GetResult()
+        } else {
+            if ($null -eq $content) {
+                $content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]@())
+            }
+            $response = $http.PostAsync($url, $content).GetAwaiter().GetResult()
+        }
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            if ($text -match 'overlay_permission_required') {
+                throw 'Overlay permission has not been granted on the TV.'
+            }
+            throw "The TV returned error $([int]$response.StatusCode): $text"
+        }
+        return $text
+    } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $content) { $content.Dispose() }
+    }
+}
+
+function Send-FileRequest([string]$Path, [string]$FilePath) {
+    $url = "http://127.0.0.1:$script:LocalTunnelPort$Path"
+    $stream = $null
+    $content = $null
+    $response = $null
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $content = New-Object System.Net.Http.StreamContent -ArgumentList $stream
+        $content.Headers.ContentLength = $stream.Length
+        $content.Headers.ContentType = New-Object System.Net.Http.Headers.MediaTypeHeaderValue('application/octet-stream')
+        $response = $http.PostAsync($url, $content).GetAwaiter().GetResult()
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            if ($text -match 'overlay_permission_required') {
+                throw 'Overlay permission has not been granted on the TV.'
+            }
+            if ($text -match 'gif_decode_failed') {
+                throw 'The TV could not decode this GIF.'
+            }
+            throw "The TV returned error $([int]$response.StatusCode): $text"
+        }
+        return $text
+    } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $content) { $content.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Ensure-TVReceiver {
+    try {
+        Send-Request 'GET' '/status' | Out-Null
+    } catch {
+        $serial = Get-TVSerial
+        & $script:AdbPath -s $serial shell am broadcast -a local.lanoverlay.tv.START -n local.lanoverlay.tv/.BootReceiver 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 700
+        Send-Request 'GET' '/status' | Out-Null
+    }
+}
+
+function Configure-TVVSync {
+    $enabled = if ($script:VSyncEnabled) { 1 } else { 0 }
+    Send-Request 'POST' "/vsync?enabled=$enabled&interval=$($script:VSyncIntervalMs)&transition=$($script:VSyncTransitionMs)" | Out-Null
+}
+
+function Configure-TVAudio {
+    $globalValue = if ($script:GlobalMuted) { 1 } else { 0 }
+    Send-Request 'POST' "/audio-mute?muted=$globalValue" | Out-Null
+}
+
+function Notify-MotionStart {
+    if (-not $script:Connected -or -not $script:OverlayActive -or -not $script:VSyncEnabled -or
+        $null -eq $script:SelectedMediaItem -or -not $script:SelectedMediaItem.RemoteVisible) { return }
+    try {
+        Send-Request 'POST' "/motion-start?id=$($script:SelectedMediaItem.Id)" | Out-Null
+    } catch {
+        Set-Status "V-Sync motion tracking failed: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+}
+
+function Save-Config {
+    if ($env:MIRROR_TO_TV_SELFTEST -eq '1' -or $env:MIRROR_TO_TV_CONNECTION_TEST -eq '1') { return }
+    try {
+        Sync-SelectedMediaItem
+        $config = [ordered]@{
+            tvIp = $ipBox.Text.Trim()
+            adbPort = [int]$adbPortBox.Value
+            size = [int]$script:OverlaySize
+            opacity = [int]$opacitySlider.Value
+            x = [double]$script:OverlayX
+            y = [double]$script:OverlayY
+            dropModeEnabled = [bool]$script:DropModeEnabled
+            updatesPerSecond = [int]$updatesPerSecondBox.Value
+            vSyncEnabled = [bool]$script:VSyncEnabled
+            vSyncIntervalMs = [int]$script:VSyncIntervalMs
+            vSyncTransitionMs = [int]$script:VSyncTransitionMs
+            globalMuted = [bool]$script:GlobalMuted
+            videoMuted = [bool]$script:VideoMuted
+            audioLibrary = @($script:AudioLibrary)
+            lastImage = $(if ($null -ne $script:SelectedMediaItem) { [string]$script:SelectedMediaItem.Path } else { '' })
+        }
+        $config | ConvertTo-Json | Set-Content -LiteralPath $script:ConfigPath -Encoding UTF8
+    } catch { }
+}
+
+function New-MediaPreviewImage([string]$Path) {
+    $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($extension -in @('.mp4', '.m4v', '.webm', '.mkv', '.3gp')) {
+        $kind = 'video'
+        $image = [System.Drawing.Bitmap]::new(640, 360)
+        $placeholderGraphics = [System.Drawing.Graphics]::FromImage($image)
+        try {
+            $placeholderGraphics.Clear([System.Drawing.Color]::FromArgb(24, 32, 45))
+            $videoFont = New-Object System.Drawing.Font('Segoe UI Semibold', 28)
+            $videoBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(225, 235, 245))
+            try {
+                $placeholderGraphics.DrawString('▶  VIDEO', $videoFont, $videoBrush, 215, 145)
+            } finally { $videoFont.Dispose(); $videoBrush.Dispose() }
+        } finally { $placeholderGraphics.Dispose() }
+    } else {
+        $kind = if ($extension -eq '.gif') { 'gif' } else { 'image' }
+        $source = [System.Drawing.Image]::FromFile($Path)
+        try {
+            $image = New-Object System.Drawing.Bitmap -ArgumentList $source
+        } finally {
+            $source.Dispose()
+        }
+    }
+    return [PSCustomObject]@{
+        Image = $image
+        Kind = $kind
+        Aspect = $image.Width / [double]$image.Height
+    }
+}
+
+function Sync-SelectedMediaItem {
+    if ($null -eq $script:SelectedMediaItem -or $script:ChangingSelection) { return }
+    $script:SelectedMediaItem.X = [double]$script:OverlayX
+    $script:SelectedMediaItem.Y = [double]$script:OverlayY
+    $script:SelectedMediaItem.Size = [int]$script:OverlaySize
+    if ($null -ne $opacitySlider) { $script:SelectedMediaItem.Opacity = [int]$opacitySlider.Value }
+    $script:SelectedMediaItem.VideoMuted = [bool]$script:VideoMuted
+    $script:SelectedMediaItem.VideoPaused = [bool]$script:VideoPaused
+}
+
+function Select-MediaItem($Item) {
+    $selectionChanged = -not [object]::ReferenceEquals($script:SelectedMediaItem, $Item)
+    Sync-SelectedMediaItem
+    if ($selectionChanged) { Reset-MoveStream }
+    $script:SelectedMediaItem = $Item
+    $script:ChangingSelection = $true
+    try {
+        if ($null -eq $Item) {
+            $script:CurrentImage = $null
+            $script:LoadedMediaPath = ''
+            $script:MediaKind = 'image'
+            $script:ImageAspect = 1.0
+            $script:VideoMuted = $false
+            $script:VideoPaused = $false
+            if ($null -ne $fileBox) { $fileBox.Text = '' }
+        } else {
+            $script:CurrentImage = $Item.Image
+            $script:LoadedMediaPath = [string]$Item.Path
+            $script:MediaKind = [string]$Item.Kind
+            $script:ImageAspect = [double]$Item.Aspect
+            $script:OverlayX = [double]$Item.X
+            $script:OverlayY = [double]$Item.Y
+            $script:VideoMuted = [bool]$Item.VideoMuted
+            $script:VideoPaused = [bool]$Item.VideoPaused
+            if ($null -ne $fileBox) { $fileBox.Text = [string]$Item.Path }
+            $script:OverlaySize = [int]$Item.Size
+            if ($null -ne $opacitySlider) { $opacitySlider.Value = [int]$Item.Opacity }
+        }
+    } finally {
+        $script:ChangingSelection = $false
+    }
+    Clamp-OverlayPosition
+    if ($null -ne $screenPreview) { $screenPreview.Invalidate() }
+}
+
+function Add-MediaItem([string]$Path, [bool]$AutoTransmit = $true) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'The media file was not found.' }
+    $previewData = New-MediaPreviewImage $Path
+    $cascade = $script:MediaItems.Count % 8
+    $item = [PSCustomObject]@{
+        Id = "media$($script:NextMediaId)"
+        Path = $Path
+        Kind = [string]$previewData.Kind
+        Image = $previewData.Image
+        Aspect = [double]$previewData.Aspect
+        X = [Math]::Min(0.72, 0.04 + ($cascade * 0.055))
+        Y = [Math]::Min(0.56, 0.04 + ($cascade * 0.045))
+        Size = [int]$script:OverlaySize
+        Opacity = [int]$opacitySlider.Value
+        VideoMuted = $false
+        VideoPaused = $false
+        RemoteVisible = $false
+    }
+    $script:NextMediaId++
+    [void]$script:MediaItems.Add($item)
+    Select-MediaItem $item
+    if ($AutoTransmit -and $script:BroadcastEnabled) { Send-MediaItem $item $false }
+    return $item
+}
+
+function Load-SelectedMedia([string]$Path, [bool]$ResetVideoMute = $true) {
+    $savedX = $script:OverlayX
+    $savedY = $script:OverlayY
+    $savedVideoMute = $script:VideoMuted
+    $item = Add-MediaItem $Path $false
+    $item.X = $savedX
+    $item.Y = $savedY
+    if (-not $ResetVideoMute) { $item.VideoMuted = $savedVideoMute }
+    Select-MediaItem $item
+}
+
+function Get-MediaItemRectangle($Item) {
+    if ($null -eq $Item) { return [System.Drawing.RectangleF]::Empty }
+    $screenWidth = [double]$screenPreview.ClientSize.Width
+    $screenHeight = [double]$screenPreview.ClientSize.Height
+    $width = $screenWidth * ([double]$Item.Size / 100.0)
+    $height = $width / [Math]::Max(0.01, [double]$Item.Aspect)
+    $maxHeight = $screenHeight
+    if ($height -gt $maxHeight) {
+        $height = $maxHeight
+        $width = $height * [double]$Item.Aspect
+    }
+    $x = [double]$Item.X * $screenWidth
+    $y = [double]$Item.Y * $screenHeight
+    return [System.Drawing.RectangleF]::new(
+        [single]$x,
+        [single]$y,
+        [single]$width,
+        [single]$height)
+}
+
+function Get-OverlayRectangle {
+    Sync-SelectedMediaItem
+    return Get-MediaItemRectangle $script:SelectedMediaItem
+}
+
+function Clamp-OverlayPosition {
+    if ($null -eq $screenPreview -or $screenPreview.ClientSize.Width -le 0) { return }
+    $rect = Get-OverlayRectangle
+    $maxX = [Math]::Max(0.0, 1.0 - ($rect.Width / $screenPreview.ClientSize.Width))
+    $maxY = [Math]::Max(0.0, 1.0 - ($rect.Height / $screenPreview.ClientSize.Height))
+    $script:OverlayX = [Math]::Max(0.0, [Math]::Min($maxX, $script:OverlayX))
+    $script:OverlayY = [Math]::Max(0.0, [Math]::Min($maxY, $script:OverlayY))
+    Sync-SelectedMediaItem
+    if ($null -ne $positionLabel) {
+        $positionLabel.Text = "Selected layer: X $([Math]::Round($script:OverlayX * 100))%  Y $([Math]::Round($script:OverlayY * 100))%"
+    }
+}
+
+function Mark-PositionDirty {
+    Sync-SelectedMediaItem
+    $script:PositionRevision++
+    $script:PositionDirty = $true
+}
+
+function Get-DesiredMoveIntervalMs {
+    if ($script:VSyncEnabled) { return [int]$script:VSyncIntervalMs }
+    $requestedRate = [Math]::Max(1, [int]$updatesPerSecondBox.Value)
+    return [double](1000.0 / $requestedRate)
+}
+
+function Get-MonotonicMilliseconds {
+    return [long]$script:MoveClock.ElapsedMilliseconds
+}
+
+function Start-PreviewDrag([double]$X, [double]$Y) {
+    if ($null -eq $script:CurrentImage) { return $false }
+    $rect = Get-OverlayRectangle
+    if (-not $rect.Contains([single]$X, [single]$Y)) { return $false }
+    $script:Dragging = $true
+    $script:DragOffset = [System.Drawing.PointF]::new(
+        [single]($X - $rect.X),
+        [single]($Y - $rect.Y))
+    return $true
+}
+
+function Update-PreviewDrag([double]$X, [double]$Y) {
+    if (-not $script:Dragging) { return $false }
+    $script:OverlayX = ($X - $script:DragOffset.X) / [double]$screenPreview.ClientSize.Width
+    $script:OverlayY = ($Y - $script:DragOffset.Y) / [double]$screenPreview.ClientSize.Height
+    Clamp-OverlayPosition
+    Mark-PositionDirty
+    $screenPreview.Invalidate()
+    if ($script:Connected) { Pump-MoveStream $false }
+    return $true
+}
+
+function Get-ResizeHandle([double]$X, [double]$Y) {
+    if ($null -eq $script:CurrentImage) { return '' }
+    $rect = Get-OverlayRectangle
+    $radius = 13.0
+    $radiusSquared = $radius * $radius
+    $handles = @(
+        @('top-left', $rect.Left, $rect.Top),
+        @('top-right', $rect.Right, $rect.Top),
+        @('bottom-left', $rect.Left, $rect.Bottom),
+        @('bottom-right', $rect.Right, $rect.Bottom)
+    )
+    foreach ($handle in $handles) {
+        $deltaX = $X - [double]$handle[1]
+        $deltaY = $Y - [double]$handle[2]
+        if (($deltaX * $deltaX) + ($deltaY * $deltaY) -le $radiusSquared) {
+            return [string]$handle[0]
+        }
+    }
+    return ''
+}
+
+function Start-PreviewResize([string]$Corner) {
+    if ([string]::IsNullOrWhiteSpace($Corner) -or $null -eq $script:CurrentImage) { return $false }
+    $rect = Get-OverlayRectangle
+    switch ($Corner) {
+        'top-left'     { $anchorX = $rect.Right; $anchorY = $rect.Bottom }
+        'top-right'    { $anchorX = $rect.Left;  $anchorY = $rect.Bottom }
+        'bottom-left'  { $anchorX = $rect.Right; $anchorY = $rect.Top }
+        'bottom-right' { $anchorX = $rect.Left;  $anchorY = $rect.Top }
+        default { return $false }
+    }
+    $script:Resizing = $true
+    $script:ResizeCorner = $Corner
+    $script:ResizeAnchor = [System.Drawing.PointF]::new([single]$anchorX, [single]$anchorY)
+    return $true
+}
+
+function Update-PreviewResize([double]$X, [double]$Y) {
+    if (-not $script:Resizing) { return $false }
+    $leftCorner = $script:ResizeCorner -like '*left'
+    $topCorner = $script:ResizeCorner -like 'top-*'
+    $signX = if ($leftCorner) { -1.0 } else { 1.0 }
+    $signY = if ($topCorner) { -1.0 } else { 1.0 }
+    $aspect = [Math]::Max(0.05, $script:ImageAspect)
+    $orientedX = $signX * ($X - $script:ResizeAnchor.X)
+    $orientedY = $signY * ($Y - $script:ResizeAnchor.Y)
+    $projectedWidth = ($orientedX + ($orientedY / $aspect)) / (1.0 + (1.0 / ($aspect * $aspect)))
+
+    $screenWidth = [double]$screenPreview.ClientSize.Width
+    $screenHeight = [double]$screenPreview.ClientSize.Height
+    $maximumWidth = [Math]::Min($screenWidth, $screenHeight * $aspect)
+    $projectedWidth = [Math]::Max($screenWidth * 0.01, [Math]::Min($maximumWidth, $projectedWidth))
+    $newPercent = [int][Math]::Round(($projectedWidth / $screenWidth) * 100.0)
+    $script:OverlaySize = [Math]::Max(1, [Math]::Min(100, $newPercent))
+    Sync-SelectedMediaItem
+
+    $actualRect = Get-OverlayRectangle
+    $newX = if ($leftCorner) { $script:ResizeAnchor.X - $actualRect.Width } else { $script:ResizeAnchor.X }
+    $newY = if ($topCorner) { $script:ResizeAnchor.Y - $actualRect.Height } else { $script:ResizeAnchor.Y }
+    $script:OverlayX = $newX / $screenWidth
+    $script:OverlayY = $newY / $screenHeight
+    Clamp-OverlayPosition
+    Mark-PositionDirty
+    $screenPreview.Invalidate()
+    if ($script:Connected) { Pump-MoveStream $false }
+    return $true
+}
+
+function Get-VideoMuteRectangle {
+    param($Item = $script:SelectedMediaItem)
+    if ($null -eq $Item -or $Item.Kind -ne 'video' -or $null -eq $Item.Image) {
+        return [System.Drawing.RectangleF]::Empty
+    }
+    $rect = Get-MediaItemRectangle $Item
+    $buttonSize = [Math]::Max(20.0, [Math]::Min(32.0, [Math]::Min($rect.Width, $rect.Height) * 0.28))
+    return [System.Drawing.RectangleF]::new(
+        [single]($rect.Left + 7.0),
+        [single]($rect.Top + 7.0),
+        [single]$buttonSize,
+        [single]$buttonSize)
+}
+
+function Get-DeleteRectangle {
+    param($Item = $script:SelectedMediaItem)
+    if ($null -eq $Item) { return [System.Drawing.RectangleF]::Empty }
+    $rect = Get-MediaItemRectangle $Item
+    $buttonSize = [Math]::Max(18.0, [Math]::Min(22.0, [Math]::Min($rect.Width, $rect.Height) * 0.18))
+    $buttonX = $rect.Right + 6.0
+    if ($buttonX + $buttonSize -gt $screenPreview.ClientSize.Width - 2) {
+        $buttonX = $screenPreview.ClientSize.Width - $buttonSize - 2
+    }
+    $buttonY = [Math]::Max(2.0, $rect.Top - ($buttonSize * 0.48))
+    return [System.Drawing.RectangleF]::new(
+        [single]$buttonX,
+        [single]$buttonY,
+        [single]$buttonSize,
+        [single]$buttonSize)
+}
+
+function Get-MediaItemAtPoint([double]$X, [double]$Y) {
+    for ($index = $script:MediaItems.Count - 1; $index -ge 0; $index--) {
+        $item = $script:MediaItems[$index]
+        $rect = Get-MediaItemRectangle $item
+        if ($rect.Contains([single]$X, [single]$Y)) { return $item }
+    }
+    return $null
+}
+
+function Remove-MediaItem($Item) {
+    if ($null -eq $Item) { return }
+    if ($script:Connected -and $Item.RemoteVisible) {
+        try { Send-Request 'POST' "/delete-media?id=$($Item.Id)" | Out-Null }
+        catch { Set-Status "The layer was removed locally. The TV watchdog will remove it automatically: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(180, 95, 35)) }
+    }
+    $wasSelected = $script:SelectedMediaItem -eq $Item
+    [void]$script:MediaItems.Remove($Item)
+    if ($wasSelected) {
+        $nextItem = if ($script:MediaItems.Count -gt 0) { $script:MediaItems[$script:MediaItems.Count - 1] } else { $null }
+        Select-MediaItem $nextItem
+    }
+    if ($null -ne $Item.Image) { $Item.Image.Dispose() }
+    $script:OverlayActive = @($script:MediaItems | Where-Object { $_.RemoteVisible }).Count -gt 0
+    Reset-MoveStream
+    $screenPreview.Invalidate()
+    Save-Config
+    Set-Status 'Layer removed from the preview and TV.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+}
+
+function Update-GlobalMuteUI {
+    if ($script:GlobalMuted) {
+        $globalMuteButton.Text = 'Global audio: Muted'
+        $globalMuteButton.BackColor = [System.Drawing.Color]::FromArgb(76, 27, 42)
+        $globalMuteButton.FlatAppearance.BorderColor = $script:ThemeDanger
+    } else {
+        $globalMuteButton.Text = 'Global audio: On'
+        $globalMuteButton.BackColor = [System.Drawing.Color]::FromArgb(18, 72, 62)
+        $globalMuteButton.FlatAppearance.BorderColor = $script:ThemeSuccess
+    }
+    $globalMuteButton.ForeColor = [System.Drawing.Color]::White
+}
+
+function Toggle-GlobalMute([bool]$LocalOnly = $false) {
+    $script:GlobalMuted = -not $script:GlobalMuted
+    Update-GlobalMuteUI
+    if ($LocalOnly) {
+        Save-Config
+        return
+    }
+    $temporaryTunnel = -not $script:Connected
+    try {
+        if ($temporaryTunnel) {
+            Open-AdbTunnel
+            Ensure-TVReceiver
+        }
+        $mutedValue = if ($script:GlobalMuted) { 1 } else { 0 }
+        Send-Request 'POST' "/audio-mute?muted=$mutedValue" | Out-Null
+        $message = if ($script:GlobalMuted) {
+            'Global audio is muted. Audio tracks and video audio are silent.'
+        } else {
+            'Global audio is enabled. Audio tracks and unmuted videos are audible.'
+        }
+        Set-Status $message ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    } catch {
+        Set-Status "The mute setting was saved locally, but the TV is unavailable: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(180, 95, 35))
+    } finally {
+        if ($temporaryTunnel) { Close-AdbTunnel }
+    }
+    Save-Config
+}
+
+function Toggle-VideoMute {
+    if ($script:MediaKind -ne 'video' -or $null -eq $script:SelectedMediaItem) { return }
+    $script:VideoMuted = -not $script:VideoMuted
+    Sync-SelectedMediaItem
+    $screenPreview.Invalidate()
+    try {
+        if ($script:Connected -and $script:SelectedMediaItem.RemoteVisible) {
+            $mutedValue = if ($script:VideoMuted) { 1 } else { 0 }
+            Send-Request 'POST' "/video-mute?id=$($script:SelectedMediaItem.Id)&muted=$mutedValue" | Out-Null
+        }
+        $message = if ($script:VideoMuted) {
+            'Audio is muted for the selected video. Audio library playback is unchanged.'
+        } else {
+            'Audio is enabled for the selected video unless global audio is muted.'
+        }
+        Set-Status $message ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    } catch {
+        Set-Status "Could not change video audio: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+    Save-Config
+}
+
+function Get-PreviewCursor([double]$X, [double]$Y) {
+    foreach ($item in @($script:MediaItems)) {
+        $deleteRectangle = Get-DeleteRectangle $item
+        $muteRectangle = Get-VideoMuteRectangle $item
+        if ((-not $deleteRectangle.IsEmpty -and $deleteRectangle.Contains([single]$X, [single]$Y)) -or
+            (-not $muteRectangle.IsEmpty -and $muteRectangle.Contains([single]$X, [single]$Y))) {
+            return [System.Windows.Forms.Cursors]::Hand
+        }
+    }
+    $handle = Get-ResizeHandle $X $Y
+    if ($handle -in @('top-left', 'bottom-right')) { return [System.Windows.Forms.Cursors]::SizeNWSE }
+    if ($handle -in @('top-right', 'bottom-left')) { return [System.Windows.Forms.Cursors]::SizeNESW }
+    if ($null -ne (Get-MediaItemAtPoint $X $Y)) { return [System.Windows.Forms.Cursors]::Hand }
+    return [System.Windows.Forms.Cursors]::Default
+}
+
+function Move-Preset([string]$Horizontal, [string]$Vertical) {
+    $rect = Get-OverlayRectangle
+    $widthFraction = $rect.Width / $screenPreview.ClientSize.Width
+    $heightFraction = $rect.Height / $screenPreview.ClientSize.Height
+    $margin = 0.025
+    if ($Horizontal -eq 'left') { $script:OverlayX = $margin }
+    elseif ($Horizontal -eq 'right') { $script:OverlayX = 1.0 - $widthFraction - $margin }
+    else { $script:OverlayX = (1.0 - $widthFraction) / 2.0 }
+    if ($Vertical -eq 'top') { $script:OverlayY = $margin }
+    elseif ($Vertical -eq 'bottom') { $script:OverlayY = 1.0 - $heightFraction - $margin }
+    else { $script:OverlayY = (1.0 - $heightFraction) / 2.0 }
+    Clamp-OverlayPosition
+    $screenPreview.Invalidate()
+    Mark-PositionDirty
+    if ($script:Connected) { Queue-FinalMove }
+}
+
+function Complete-MoveRequestIfReady {
+    if ($null -eq $script:MoveTask -or -not $script:MoveTask.IsCompleted) { return }
+
+    $response = $null
+    try {
+        $response = $script:MoveTask.GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw "The TV returned error $([int]$response.StatusCode)."
+        }
+        $script:MoveFailures = 0
+        $script:MoveRequestsSucceeded++
+        if ($script:PositionRevision -le $script:MoveSentRevision) {
+            $script:PositionDirty = $false
+        } else {
+            $script:PositionDirty = $true
+        }
+    } catch {
+        $script:MoveFailures++
+        $script:PositionDirty = $true
+        if ($script:DropModeEnabled) { $script:ForceMovePending = $true }
+        $backoffMs = [Math]::Max((Get-DesiredMoveIntervalMs), [Math]::Min(2000, 200 * $script:MoveFailures))
+        $script:MoveNextAllowedAt = (Get-MonotonicMilliseconds) + $backoffMs
+        if ($script:MoveFailures -ge 3 -and -not $script:Closing) {
+            Set-Status "Position updates are delayed. Retrying the latest position: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+        }
+    } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $script:MoveRequest) { $script:MoveRequest.Dispose() }
+        $script:MoveRequest = $null
+        $script:MoveTask = $null
+    }
+}
+
+function Start-MoveRequest([bool]$Forced) {
+    if ($null -eq $script:SelectedMediaItem -or -not $script:SelectedMediaItem.RemoteVisible) { return }
+    Sync-SelectedMediaItem
+    $x = [Math]::Round($script:OverlayX * 1000)
+    $y = [Math]::Round($script:OverlayY * 1000)
+    $width = $script:OverlaySize * 10
+    $opacity = $opacitySlider.Value
+    $url = "http://127.0.0.1:$script:LocalTunnelPort/move?id=$($script:SelectedMediaItem.Id)&x=$x&y=$y&w=$width&opacity=$opacity"
+    $request = New-Object System.Net.Http.HttpRequestMessage(
+        [System.Net.Http.HttpMethod]::Post, $url)
+    $request.Content = New-Object System.Net.Http.ByteArrayContent -ArgumentList (,[byte[]]@())
+    $script:MoveRequest = $request
+    $script:MoveSentRevision = $script:PositionRevision
+    $script:MoveNextAllowedAt = (Get-MonotonicMilliseconds) + (Get-DesiredMoveIntervalMs)
+    $script:MoveRequestsStarted++
+    if ($env:MIRROR_TO_TV_STREAM_TEST -eq '1') { $script:MoveRequestTimes += (Get-MonotonicMilliseconds) }
+    if ($Forced) { $script:ForceMovePending = $false }
+    try {
+        $script:MoveTask = $moveHttp.SendAsync($request)
+    } catch {
+        $request.Dispose()
+        $script:MoveRequest = $null
+        $script:MoveTask = $null
+        $script:MoveFailures++
+        $script:PositionDirty = $true
+        if ($Forced) { $script:ForceMovePending = $true }
+    }
+}
+
+function Pump-MoveStream([bool]$Force = $false) {
+    Complete-MoveRequestIfReady
+    if ($null -ne $script:MoveTask -or -not $script:Connected -or -not $script:OverlayActive -or
+        $null -eq $script:SelectedMediaItem -or -not $script:SelectedMediaItem.RemoteVisible -or
+        $script:Closing -or -not $script:PositionDirty) { return }
+    if ($script:DropModeEnabled -and -not $Force) { return }
+    if (-not $Force -and (Get-MonotonicMilliseconds) -lt $script:MoveNextAllowedAt) { return }
+    Start-MoveRequest $Force
+}
+
+function Queue-FinalMove {
+    if (-not $script:Connected -or -not $script:OverlayActive) { return }
+    $script:ForceMovePending = $true
+    Pump-MoveStream $true
+}
+
+function Reset-MoveStream {
+    try { $moveHttp.CancelPendingRequests() } catch { }
+    if ($null -ne $script:MoveRequest) {
+        try { $script:MoveRequest.Dispose() } catch { }
+    }
+    $script:MoveRequest = $null
+    $script:MoveTask = $null
+    $script:MoveNextAllowedAt = 0L
+    $script:ForceMovePending = $false
+    $script:PositionDirty = $false
+}
+
+function Send-MoveUpdate([bool]$Quiet = $true) {
+    if (-not $script:Connected -or $null -eq $script:SelectedMediaItem -or -not $script:SelectedMediaItem.RemoteVisible) { return }
+    Sync-SelectedMediaItem
+    $x = [Math]::Round($script:OverlayX * 1000)
+    $y = [Math]::Round($script:OverlayY * 1000)
+    $width = $script:OverlaySize * 10
+    $opacity = $opacitySlider.Value
+    try {
+        Send-Request 'POST' "/move?id=$($script:SelectedMediaItem.Id)&x=$x&y=$y&w=$width&opacity=$opacity" | Out-Null
+        $script:PositionDirty = $false
+        $script:MoveFailures = 0
+    } catch {
+        $script:MoveFailures++
+        if (-not $Quiet -or $script:MoveFailures -ge 3) {
+            Set-Status "Could not send the layer position: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+        }
+    }
+}
+
+function Refresh-AudioLibraryUI {
+    $audioLibraryFlow.SuspendLayout()
+    try {
+        $audioLibraryFlow.Controls.Clear()
+        if ($script:AudioLibrary.Count -eq 0) {
+            $emptyLabel = New-Label "No audio files added`nMP3 · M4A · AAC · OGG · WAV · FLAC" 6 8 238 50
+            $emptyLabel.Font = New-Object System.Drawing.Font('Consolas', 8)
+            $emptyLabel.ForeColor = $script:ThemeMuted
+            $audioLibraryFlow.Controls.Add($emptyLabel)
+            return
+        }
+
+        foreach ($audioPath in @($script:AudioLibrary)) {
+            $row = New-Object System.Windows.Forms.Panel
+            $row.Size = New-Object System.Drawing.Size(242, 44)
+            $row.Margin = New-Object System.Windows.Forms.Padding(2, 2, 2, 4)
+            $row.BackColor = $script:ThemeSurfaceRaised
+
+            $nameLabel = New-Label ([System.IO.Path]::GetFileName([string]$audioPath)) 7 9 143 26
+            $nameLabel.AutoEllipsis = $true
+            $nameLabel.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+            $toolTip.SetToolTip($nameLabel, [string]$audioPath)
+            $row.Controls.Add($nameLabel)
+
+            $playButton = New-Object System.Windows.Forms.Button
+            $playButton.Text = '▶'
+            $playButton.Tag = [string]$audioPath
+            $playButton.Location = New-Object System.Drawing.Point(153, 5)
+            $playButton.Size = New-Object System.Drawing.Size(48, 34)
+            Style-Button $playButton 'accent'
+            $playButton.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 11)
+            $playButton.Add_Click({
+                param($sender, $eventArgs)
+                Play-AudioTrack ([string]$sender.Tag)
+            })
+            $row.Controls.Add($playButton)
+
+            $removeButton = New-Object System.Windows.Forms.Button
+            $removeButton.Text = '×'
+            $removeButton.Tag = [string]$audioPath
+            $removeButton.Location = New-Object System.Drawing.Point(205, 5)
+            $removeButton.Size = New-Object System.Drawing.Size(32, 34)
+            Style-Button $removeButton 'danger'
+            $removeButton.Add_Click({
+                param($sender, $eventArgs)
+                [void]$script:AudioLibrary.Remove([string]$sender.Tag)
+                Refresh-AudioLibraryUI
+                Save-Config
+            })
+            $row.Controls.Add($removeButton)
+            $audioLibraryFlow.Controls.Add($row)
+        }
+    } finally {
+        $audioLibraryFlow.ResumeLayout()
+    }
+}
+
+function Play-AudioTrack([string]$Path) {
+    if (-not $script:BroadcastEnabled) {
+        Set-Status 'Enable broadcasting before starting audio playback.' ([System.Drawing.Color]::FromArgb(180, 95, 35))
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Set-Status 'The audio file was not found.' ([System.Drawing.Color]::Firebrick)
+        return
+    }
+    $fileInfo = Get-Item -LiteralPath $Path
+    if ($fileInfo.Length -gt 150MB) {
+        Set-Status 'The audio file is too large. Maximum size: 150 MB.' ([System.Drawing.Color]::Firebrick)
+        return
+    }
+    $extension = [System.IO.Path]::GetExtension($Path).TrimStart('.').ToLowerInvariant()
+    if ($extension -notin @('mp3', 'm4a', 'aac', 'ogg', 'wav', 'flac')) {
+        Set-Status 'This audio format is not supported.' ([System.Drawing.Color]::Firebrick)
+        return
+    }
+
+    Set-Status "Sending audio to the TV: $([System.IO.Path]::GetFileName($Path))" ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    try {
+        Open-AdbTunnel
+        Ensure-TVReceiver
+        Send-Request 'POST' '/hide' | Out-Null
+        Send-Request 'POST' '/stop-audio' | Out-Null
+        Configure-TVAudio
+        Send-FileRequest "/play-audio?ext=$extension" $Path | Out-Null
+        $script:Connected = $true
+        $script:AudioSessionActive = $true
+        $script:CurrentAudioPath = $Path
+        $currentAudioLabel.Text = "Now playing: $([System.IO.Path]::GetFileName($Path))"
+        $heartbeat.Start()
+        Save-Config
+        if ($script:GlobalMuted) {
+            Set-Status 'Audio playback started, but global audio is muted.' ([System.Drawing.Color]::FromArgb(180, 95, 35))
+        } else {
+            Set-Status 'Audio is playing on the TV.' ([System.Drawing.Color]::FromArgb(55, 125, 80))
+        }
+    } catch {
+        if (-not $script:OverlayActive) {
+            $script:Connected = $false
+            $script:AudioSessionActive = $false
+            $heartbeat.Stop()
+            Close-AdbTunnel
+        }
+        Set-Status "Could not start audio playback: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+}
+
+function Stop-AudioTrack {
+    try {
+        if ($script:Connected) { Send-Request 'POST' '/stop-audio' | Out-Null }
+        $script:AudioSessionActive = $false
+        $script:CurrentAudioPath = ''
+        $currentAudioLabel.Text = 'Now playing: None'
+        Set-Status 'Audio playback stopped.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    } catch {
+        Set-Status "Could not stop audio playback: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+}
+
+function Send-MediaItem($Item, [bool]$Quiet = $false) {
+    if ($null -eq $Item -or -not (Test-Path -LiteralPath $Item.Path -PathType Leaf)) {
+        if (-not $Quiet) { Set-Status 'Select an image, GIF, or video first.' ([System.Drawing.Color]::Firebrick) }
+        return
+    }
+    if (-not $script:BroadcastEnabled) {
+        if (-not $Quiet) { Set-Status 'The layer is available in the preview only. Enable broadcasting to show it on the TV.' ([System.Drawing.Color]::FromArgb(70, 78, 92)) }
+        return
+    }
+    if ($Item -eq $script:SelectedMediaItem) { Sync-SelectedMediaItem }
+    $fileInfo = Get-Item -LiteralPath $Item.Path
+    $maximumBytes = if ($Item.Kind -eq 'image') { 12MB } else { 150MB }
+    if ($fileInfo.Length -gt $maximumBytes) {
+        if (-not $Quiet) { Set-Status "The file is too large. Maximum size: $([Math]::Round($maximumBytes / 1MB)) MB." ([System.Drawing.Color]::Firebrick) }
+        return
+    }
+    if (-not $Quiet) { Set-Status 'Connecting and sending media to the TV.' ([System.Drawing.Color]::FromArgb(70, 78, 92)) }
+    $hadAudioSession = $script:AudioSessionActive
+    try {
+        if ($Item -eq $script:SelectedMediaItem) { Reset-MoveStream }
+        Open-AdbTunnel
+        Ensure-TVReceiver
+        Configure-TVVSync
+        Configure-TVAudio
+        $x = [Math]::Round([double]$Item.X * 1000)
+        $y = [Math]::Round([double]$Item.Y * 1000)
+        $width = [int]$Item.Size * 10
+        $opacity = [int]$Item.Opacity
+        $extension = [System.IO.Path]::GetExtension($Item.Path).TrimStart('.').ToLowerInvariant()
+        $aspect = [Math]::Round([double]$Item.Aspect * 1000)
+        if ($Item.Kind -eq 'gif') {
+            $path = "/show-media?id=$($Item.Id)&type=gif&ext=gif&x=$x&y=$y&w=$width&opacity=$opacity&aspect=$aspect"
+        } elseif ($Item.Kind -eq 'video') {
+            $videoMutedValue = if ($Item.VideoMuted) { 1 } else { 0 }
+            $path = "/show-media?id=$($Item.Id)&type=video&ext=$extension&x=$x&y=$y&w=$width&opacity=$opacity&aspect=$aspect&videoMuted=$videoMutedValue"
+        } else {
+            $path = "/show?id=$($Item.Id)&x=$x&y=$y&w=$width&opacity=$opacity"
+        }
+        Send-FileRequest $path $Item.Path | Out-Null
+        $Item.RemoteVisible = $true
+        $script:Connected = $true
+        $script:OverlayActive = $true
+        $script:PositionDirty = $false
+        $script:MoveFailures = 0
+        $Item.VideoPaused = $false
+        if ($Item -eq $script:SelectedMediaItem) { $script:VideoPaused = $false }
+        $heartbeat.Start()
+        $positionStreamTimer.Start()
+        Save-Config
+        if (-not $Quiet) { Set-Status "Broadcasting $($script:MediaItems.Count) layer(s). The selected layer can be positioned independently." ([System.Drawing.Color]::FromArgb(55, 125, 80)) }
+    } catch {
+        $Item.RemoteVisible = $false
+        $script:OverlayActive = @($script:MediaItems | Where-Object { $_.RemoteVisible }).Count -gt 0
+        if (-not $script:OverlayActive) { $positionStreamTimer.Stop() }
+        if ($hadAudioSession -or $script:OverlayActive) {
+            $script:Connected = $true
+            $script:AudioSessionActive = $hadAudioSession
+            $heartbeat.Start()
+        } else {
+            $script:Connected = $false
+            $script:AudioSessionActive = $false
+            $heartbeat.Stop()
+            Close-AdbTunnel
+        }
+        if (-not $Quiet) { Set-Status "Could not display the layer: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick) }
+    }
+}
+
+function Send-CurrentMedia([bool]$Quiet = $false) {
+    Send-MediaItem $script:SelectedMediaItem $Quiet
+}
+
+function Hide-And-Disconnect([bool]$Quiet = $false) {
+    $heartbeat.Stop()
+    $positionStreamTimer.Stop()
+    $script:Connected = $false
+    $script:OverlayActive = $false
+    $script:AudioSessionActive = $false
+    $script:CurrentAudioPath = ''
+    foreach ($item in @($script:MediaItems)) { $item.RemoteVisible = $false }
+    Reset-MoveStream
+    try {
+        if (-not $script:TunnelOpen) { Open-AdbTunnel }
+        Ensure-TVReceiver
+        Send-Request 'POST' '/hide' | Out-Null
+        Send-Request 'POST' '/stop-audio' | Out-Null
+        $currentAudioLabel.Text = 'Now playing: None'
+        if (-not $Quiet) {
+            Set-Status 'Broadcast stopped. All layers and audio were removed, and the ADB tunnel was closed.' ([System.Drawing.Color]::FromArgb(55, 125, 80))
+        }
+    } catch {
+        if (-not $Quiet) {
+            Set-Status 'The TV is unavailable. Its watchdog will remove the layers within approximately 30 seconds.' ([System.Drawing.Color]::FromArgb(180, 95, 35))
+        }
+    }
+    Close-AdbTunnel
+}
+
+function Update-BroadcastUI {
+    if ($script:BroadcastEnabled) {
+        $broadcastButton.Text = 'Broadcast: On'
+        $broadcastButton.BackColor = [System.Drawing.Color]::FromArgb(17, 92, 76)
+        $broadcastButton.FlatAppearance.BorderColor = $script:ThemeSuccess
+    } else {
+        $broadcastButton.Text = 'Broadcast: Off'
+        $broadcastButton.BackColor = $script:ThemeSurfaceRaised
+        $broadcastButton.FlatAppearance.BorderColor = $script:ThemeBorder
+    }
+    $broadcastButton.ForeColor = [System.Drawing.Color]::White
+}
+
+function Set-BroadcastEnabled([bool]$Enabled) {
+    if ($script:BroadcastEnabled -eq $Enabled) { return }
+    $script:BroadcastEnabled = $Enabled
+    Update-BroadcastUI
+    if ($Enabled) {
+        if ($script:MediaItems.Count -eq 0) {
+            Set-Status 'Broadcasting is enabled. New layers will appear on the TV automatically.' ([System.Drawing.Color]::FromArgb(55, 125, 80))
+        } else {
+            $sent = 0
+            foreach ($item in @($script:MediaItems)) {
+                Send-MediaItem $item $true
+                if ($item.RemoteVisible) { $sent++ }
+            }
+            Set-Status "Broadcasting enabled. Sent $sent of $($script:MediaItems.Count) layer(s)." ([System.Drawing.Color]::FromArgb(55, 125, 80))
+        }
+    } else {
+        Hide-And-Disconnect $true
+        Set-Status 'Broadcasting disabled. TV layers and audio were removed; the local preview was preserved.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    }
+    Save-Config
+}
+
+function Style-Button($Button, [string]$Mode = 'neutral') {
+    $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $Button.FlatAppearance.BorderSize = 1
+    $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(27, 42, 62)
+    $Button.FlatAppearance.MouseDownBackColor = [System.Drawing.Color]::FromArgb(18, 90, 108)
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Button.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $Button.ForeColor = $script:ThemeText
+    switch ($Mode) {
+        'accent' {
+            $Button.BackColor = $script:ThemeAccentDark
+            $Button.FlatAppearance.BorderColor = $script:ThemeAccent
+        }
+        'danger' {
+            $Button.BackColor = [System.Drawing.Color]::FromArgb(76, 27, 42)
+            $Button.FlatAppearance.BorderColor = $script:ThemeDanger
+        }
+        default {
+            $Button.BackColor = $script:ThemeSurfaceRaised
+            $Button.FlatAppearance.BorderColor = $script:ThemeBorder
+        }
+    }
+}
+
+function Style-Input($Control) {
+    $Control.BackColor = [System.Drawing.Color]::FromArgb(10, 17, 28)
+    $Control.ForeColor = $script:ThemeText
+    if ($Control -is [System.Windows.Forms.TextBox]) {
+        $Control.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    }
+}
+
+function New-CardPanel([int]$X, [int]$Y, [int]$Width, [int]$Height) {
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Location = New-Object System.Drawing.Point($X, $Y)
+    $panel.Size = New-Object System.Drawing.Size($Width, $Height)
+    $panel.BackColor = $script:ThemeSurface
+    $panel.Add_Paint({
+        param($sender, $eventArgs)
+        $borderPen = New-Object System.Drawing.Pen($script:ThemeBorder, 1)
+        try {
+            $eventArgs.Graphics.DrawRectangle($borderPen, 0, 0,
+                [Math]::Max(0, $sender.ClientSize.Width - 1),
+                [Math]::Max(0, $sender.ClientSize.Height - 1))
+        } finally { $borderPen.Dispose() }
+    })
+    return $panel
+}
+
+function New-SectionLabel([string]$Text, [int]$X, [int]$Y, [int]$Width) {
+    $label = New-Label $Text $X $Y $Width 22
+    $label.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+    $label.ForeColor = $script:ThemeAccent
+    return $label
+}
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'mirror-to-tv 1.0'
+$form.StartPosition = 'CenterScreen'
+$form.ClientSize = New-Object System.Drawing.Size(1280, 705)
+$form.MinimumSize = New-Object System.Drawing.Size(1296, 744)
+$form.MaximumSize = New-Object System.Drawing.Size(1296, 744)
+$form.BackColor = $script:ThemeBackground
+$form.ForeColor = $script:ThemeText
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+$title = New-Label 'MIRROR TO TV' 25 12 410 34
+$title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 19)
+$title.ForeColor = $script:ThemeText
+$form.Controls.Add($title)
+$subtitle = New-Label 'LOCAL MEDIA OVERLAYS FOR ANDROID TV' 27 47 690 20
+$subtitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+$subtitle.ForeColor = $script:ThemeMuted
+$form.Controls.Add($subtitle)
+$accentLine = New-Object System.Windows.Forms.Panel
+$accentLine.Location = New-Object System.Drawing.Point(25, 70)
+$accentLine.Size = New-Object System.Drawing.Size(693, 2)
+$accentLine.BackColor = $script:ThemeAccent
+$form.Controls.Add($accentLine)
+
+$mediaToolbar = New-CardPanel 25 82 693 40
+$form.Controls.Add($mediaToolbar)
+$fileBox = New-Object System.Windows.Forms.TextBox
+$fileBox.Location = New-Object System.Drawing.Point(10, 8)
+$fileBox.Size = New-Object System.Drawing.Size(525, 24)
+$fileBox.ReadOnly = $true
+$fileBox.Text = 'No media selected'
+Style-Input $fileBox
+$mediaToolbar.Controls.Add($fileBox)
+$browseButton = New-Object System.Windows.Forms.Button
+$browseButton.Text = '+  ADD MEDIA'
+$browseButton.Location = New-Object System.Drawing.Point(543, 5)
+$browseButton.Size = New-Object System.Drawing.Size(140, 30)
+Style-Button $browseButton 'accent'
+$mediaToolbar.Controls.Add($browseButton)
+
+$screenPreview = New-Object System.Windows.Forms.Panel
+$screenPreview.Location = New-Object System.Drawing.Point(25, 132)
+$screenPreview.Size = New-Object System.Drawing.Size(640, 360)
+$screenPreview.BackColor = [System.Drawing.Color]::FromArgb(6, 10, 17)
+$screenPreview.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+$screenPreview.TabStop = $true
+$form.Controls.Add($screenPreview)
+
+$opacityPanel = New-CardPanel 674 132 44 360
+$form.Controls.Add($opacityPanel)
+$opacityValue = New-Label '100' 0 9 44 22
+$opacityValue.Font = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold)
+$opacityValue.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$opacityValue.ForeColor = $script:ThemeAccent
+$opacityPanel.Controls.Add($opacityValue)
+$opacitySlider = New-Object System.Windows.Forms.TrackBar
+$opacitySlider.Location = New-Object System.Drawing.Point(4, 38)
+$opacitySlider.Size = New-Object System.Drawing.Size(36, 260)
+$opacitySlider.Orientation = [System.Windows.Forms.Orientation]::Vertical
+$opacitySlider.TickStyle = [System.Windows.Forms.TickStyle]::None
+$opacitySlider.Minimum = 0
+$opacitySlider.Maximum = 100
+$opacitySlider.Value = 100
+$opacitySlider.BackColor = $script:ThemeSurface
+$opacityPanel.Controls.Add($opacitySlider)
+$eyeIcon = New-Object System.Windows.Forms.Panel
+$eyeIcon.Location = New-Object System.Drawing.Point(5, 316)
+$eyeIcon.Size = New-Object System.Drawing.Size(34, 30)
+$eyeIcon.BackColor = [System.Drawing.Color]::Transparent
+$eyeIcon.Add_Paint({
+    param($sender, $eventArgs)
+    $eventArgs.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $eyePath = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $eyePen = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 2)
+    $pupilBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+    try {
+        $eyePath.AddBezier(3, 15, 9, 5, 25, 5, 31, 15)
+        $eyePath.AddBezier(31, 15, 25, 25, 9, 25, 3, 15)
+        $eyePath.CloseFigure()
+        $eventArgs.Graphics.DrawPath($eyePen, $eyePath)
+        $eventArgs.Graphics.FillEllipse($pupilBrush, 14, 11, 7, 7)
+    } finally {
+        $eyePath.Dispose()
+        $eyePen.Dispose()
+        $pupilBrush.Dispose()
+    }
+})
+$opacityPanel.Controls.Add($eyeIcon)
+
+$positionLabel = New-Label 'Selected layer: X 0%  Y 0%' 25 503 693 22
+$positionLabel.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$positionLabel.ForeColor = $script:ThemeMuted
+$form.Controls.Add($positionLabel)
+
+$broadcastButton = New-Object System.Windows.Forms.Button
+$broadcastButton.Text = 'Broadcast: Off'
+$broadcastButton.Location = New-Object System.Drawing.Point(25, 540)
+$broadcastButton.Size = New-Object System.Drawing.Size(693, 52)
+$broadcastButton.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+Style-Button $broadcastButton 'neutral'
+$form.Controls.Add($broadcastButton)
+
+$controlPanel = New-CardPanel 735 18 225 610
+$form.Controls.Add($controlPanel)
+$controlPanel.Controls.Add((New-SectionLabel 'TV CONNECTION' 14 13 195))
+$ipLabel = New-Label 'IP' 14 43 42 22
+$ipLabel.ForeColor = $script:ThemeMuted
+$controlPanel.Controls.Add($ipLabel)
+$ipBox = New-Object System.Windows.Forms.TextBox
+$ipBox.Location = New-Object System.Drawing.Point(60, 40)
+$ipBox.Size = New-Object System.Drawing.Size(148, 25)
+$ipBox.Text = ''
+Style-Input $ipBox
+$controlPanel.Controls.Add($ipBox)
+$portLabel = New-Label 'PORT' 14 76 42 22
+$portLabel.ForeColor = $script:ThemeMuted
+$controlPanel.Controls.Add($portLabel)
+$adbPortBox = New-Object System.Windows.Forms.NumericUpDown
+$adbPortBox.Location = New-Object System.Drawing.Point(60, 73)
+$adbPortBox.Size = New-Object System.Drawing.Size(148, 25)
+$adbPortBox.Minimum = 1
+$adbPortBox.Maximum = 65535
+$adbPortBox.Value = 5555
+$adbPortBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+Style-Input $adbPortBox
+$controlPanel.Controls.Add($adbPortBox)
+$checkButton = New-Object System.Windows.Forms.Button
+$checkButton.Text = 'TEST CONNECTION'
+$checkButton.Location = New-Object System.Drawing.Point(14, 108)
+$checkButton.Size = New-Object System.Drawing.Size(194, 34)
+Style-Button $checkButton
+$controlPanel.Controls.Add($checkButton)
+
+$controlPanel.Controls.Add((New-SectionLabel 'PLACEMENT' 14 162 195))
+function New-PresetButton([string]$Text, [int]$X, [int]$Y) {
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $Text
+    $button.Location = New-Object System.Drawing.Point($X, $Y)
+    $button.Size = New-Object System.Drawing.Size(34, 34)
+    Style-Button $button
+    $button.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 11)
+    $controlPanel.Controls.Add($button)
+    return $button
+}
+$topLeftButton = New-PresetButton '↖' 14 190
+$topRightButton = New-PresetButton '↗' 54 190
+$centerButton = New-PresetButton '●' 94 190
+$bottomLeftButton = New-PresetButton '↙' 134 190
+$bottomRightButton = New-PresetButton '↘' 174 190
+$scaleHint = New-Label 'Resize: corner handles or wheel' 14 231 194 20
+$scaleHint.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+$scaleHint.ForeColor = $script:ThemeMuted
+$controlPanel.Controls.Add($scaleHint)
+
+$controlPanel.Controls.Add((New-SectionLabel 'MOTION' 14 268 195))
+$rateLabel = New-Label 'Updates per second' 14 298 122 22
+$rateLabel.ForeColor = $script:ThemeMuted
+$controlPanel.Controls.Add($rateLabel)
+$updatesPerSecondBox = New-Object System.Windows.Forms.NumericUpDown
+$updatesPerSecondBox.Location = New-Object System.Drawing.Point(137, 295)
+$updatesPerSecondBox.Size = New-Object System.Drawing.Size(71, 25)
+$updatesPerSecondBox.Minimum = 10
+$updatesPerSecondBox.Maximum = 120
+$updatesPerSecondBox.Value = 10
+$updatesPerSecondBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+Style-Input $updatesPerSecondBox
+$controlPanel.Controls.Add($updatesPerSecondBox)
+$vSyncButton = New-Object System.Windows.Forms.Button
+$vSyncButton.Text = 'V-Sync: Off'
+$vSyncButton.Location = New-Object System.Drawing.Point(14, 331)
+$vSyncButton.Size = New-Object System.Drawing.Size(112, 34)
+Style-Button $vSyncButton
+$controlPanel.Controls.Add($vSyncButton)
+$vSyncIntervalBox = New-Object System.Windows.Forms.NumericUpDown
+$vSyncIntervalBox.Location = New-Object System.Drawing.Point(137, 336)
+$vSyncIntervalBox.Size = New-Object System.Drawing.Size(71, 25)
+$vSyncIntervalBox.Minimum = 50
+$vSyncIntervalBox.Maximum = 10000
+$vSyncIntervalBox.Increment = 10
+$vSyncIntervalBox.Value = 500
+$vSyncIntervalBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+$vSyncIntervalBox.ThousandsSeparator = $true
+Style-Input $vSyncIntervalBox
+$controlPanel.Controls.Add($vSyncIntervalBox)
+$vSyncUnitLabel = New-Label 'Interval (ms)' 137 365 72 18
+$vSyncUnitLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 6.5)
+$vSyncUnitLabel.ForeColor = $script:ThemeMuted
+$vSyncUnitLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$controlPanel.Controls.Add($vSyncUnitLabel)
+$vSyncTransitionLabel = New-Label 'Transition (ms)' 14 390 116 22
+$vSyncTransitionLabel.ForeColor = $script:ThemeMuted
+$controlPanel.Controls.Add($vSyncTransitionLabel)
+$vSyncTransitionBox = New-Object System.Windows.Forms.NumericUpDown
+$vSyncTransitionBox.Location = New-Object System.Drawing.Point(137, 387)
+$vSyncTransitionBox.Size = New-Object System.Drawing.Size(71, 25)
+$vSyncTransitionBox.Minimum = 50
+$vSyncTransitionBox.Maximum = 5000
+$vSyncTransitionBox.Increment = 10
+$vSyncTransitionBox.Value = 500
+$vSyncTransitionBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+$vSyncTransitionBox.ThousandsSeparator = $true
+Style-Input $vSyncTransitionBox
+$controlPanel.Controls.Add($vSyncTransitionBox)
+$dropModeButton = New-Object System.Windows.Forms.Button
+$dropModeButton.Text = 'Drop mode: Off'
+$dropModeButton.Location = New-Object System.Drawing.Point(14, 430)
+$dropModeButton.Size = New-Object System.Drawing.Size(194, 36)
+Style-Button $dropModeButton
+$controlPanel.Controls.Add($dropModeButton)
+$mediaControlButton = New-Object System.Windows.Forms.Button
+$mediaControlButton.Text = 'Pause / resume video'
+$mediaControlButton.Location = New-Object System.Drawing.Point(14, 479)
+$mediaControlButton.Size = New-Object System.Drawing.Size(194, 36)
+Style-Button $mediaControlButton
+$controlPanel.Controls.Add($mediaControlButton)
+$consoleNote = New-Label 'Receiver: local ADB tunnel' 14 565 194 20
+$consoleNote.Font = New-Object System.Drawing.Font('Consolas', 7.5)
+$consoleNote.ForeColor = $script:ThemeMuted
+$consoleNote.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+$controlPanel.Controls.Add($consoleNote)
+
+$audioPanel = New-CardPanel 978 18 282 610
+$form.Controls.Add($audioPanel)
+$audioTitle = New-Label 'AUDIO LIBRARY' 14 13 250 30
+$audioTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
+$audioPanel.Controls.Add($audioTitle)
+$audioSubtitle = New-Label 'INDEPENDENT AUDIO PLAYBACK ON TV' 15 43 250 18
+$audioSubtitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7)
+$audioSubtitle.ForeColor = $script:ThemeMuted
+$audioPanel.Controls.Add($audioSubtitle)
+$addAudioButton = New-Object System.Windows.Forms.Button
+$addAudioButton.Text = '+  ADD AUDIO'
+$addAudioButton.Location = New-Object System.Drawing.Point(14, 72)
+$addAudioButton.Size = New-Object System.Drawing.Size(254, 38)
+Style-Button $addAudioButton 'accent'
+$audioPanel.Controls.Add($addAudioButton)
+$globalMuteButton = New-Object System.Windows.Forms.Button
+$globalMuteButton.Location = New-Object System.Drawing.Point(14, 118)
+$globalMuteButton.Size = New-Object System.Drawing.Size(254, 40)
+Style-Button $globalMuteButton
+$audioPanel.Controls.Add($globalMuteButton)
+$stopAudioButton = New-Object System.Windows.Forms.Button
+$stopAudioButton.Text = '■  STOP AUDIO'
+$stopAudioButton.Location = New-Object System.Drawing.Point(14, 166)
+$stopAudioButton.Size = New-Object System.Drawing.Size(254, 34)
+Style-Button $stopAudioButton 'danger'
+$audioPanel.Controls.Add($stopAudioButton)
+$currentAudioLabel = New-Label 'Now playing: None' 14 211 254 35
+$currentAudioLabel.AutoEllipsis = $true
+$currentAudioLabel.Font = New-Object System.Drawing.Font('Consolas', 8.5)
+$currentAudioLabel.ForeColor = $script:ThemeMuted
+$audioPanel.Controls.Add($currentAudioLabel)
+$audioLibraryFlow = New-Object System.Windows.Forms.FlowLayoutPanel
+$audioLibraryFlow.Location = New-Object System.Drawing.Point(10, 250)
+$audioLibraryFlow.Size = New-Object System.Drawing.Size(262, 346)
+$audioLibraryFlow.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+$audioLibraryFlow.WrapContents = $false
+$audioLibraryFlow.AutoScroll = $true
+$audioLibraryFlow.BackColor = $script:ThemeSurface
+$audioPanel.Controls.Add($audioLibraryFlow)
+
+$statusPanel = New-CardPanel 25 646 1235 40
+$form.Controls.Add($statusPanel)
+$statusSignal = New-Object System.Windows.Forms.Panel
+$statusSignal.Location = New-Object System.Drawing.Point(12, 13)
+$statusSignal.Size = New-Object System.Drawing.Size(10, 10)
+$statusSignal.BackColor = $script:ThemeAccent
+$statusPanel.Controls.Add($statusSignal)
+$statusLabel = New-Label 'Ready. Select media to begin.' 34 8 1185 24
+$statusLabel.AutoEllipsis = $true
+$statusLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+$statusLabel.ForeColor = $script:ThemeMuted
+$statusPanel.Controls.Add($statusLabel)
+
+$toolTip = New-Object System.Windows.Forms.ToolTip
+$toolTip.SetToolTip($eyeIcon, 'Opacity of the selected layer')
+$toolTip.SetToolTip($vSyncIntervalBox, 'How often the desktop sends a new target position.')
+$toolTip.SetToolTip($vSyncTransitionBox, 'Animation time on the TV. Lower is faster; higher is more gradual.')
+Update-BroadcastUI
+Update-GlobalMuteUI
+Refresh-AudioLibraryUI
+
+$heartbeat = New-Object System.Windows.Forms.Timer
+$heartbeat.Interval = 10000
+$heartbeat.Add_Tick({
+    if (-not $script:Connected -or $script:Closing) { return }
+    try {
+        Send-Request 'POST' '/ping' | Out-Null
+    } catch {
+        $heartbeat.Stop()
+        $positionStreamTimer.Stop()
+        $script:Connected = $false
+        $script:OverlayActive = $false
+        $script:AudioSessionActive = $false
+        foreach ($item in @($script:MediaItems)) { $item.RemoteVisible = $false }
+        Close-AdbTunnel
+        Set-Status 'Connection lost. The TV will stop all layers and audio automatically.' ([System.Drawing.Color]::FromArgb(180, 95, 35))
+    }
+})
+
+$positionStreamTimer = New-Object System.Windows.Forms.Timer
+# The timer only pumps/completes the queue; Get-DesiredMoveIntervalMs applies
+# the selected 10-120/s (or V-Sync) limit. A 5 ms pump also delivers a queued
+# mouse-up position promptly after an older slow request completes.
+$positionStreamTimer.Interval = 5
+$positionStreamTimer.Add_Tick({
+    if ($script:Connected -and -not $script:Closing) { Pump-MoveStream $script:ForceMovePending }
+})
+
+function Update-VSyncUI {
+    if ($script:VSyncEnabled) {
+        $vSyncButton.Text = 'V-Sync: On'
+        $vSyncButton.BackColor = [System.Drawing.Color]::FromArgb(34, 73, 110)
+        $vSyncButton.FlatAppearance.BorderColor = $script:ThemeAccent
+        $vSyncButton.ForeColor = [System.Drawing.Color]::White
+        $updatesPerSecondBox.Enabled = $false
+        $vSyncIntervalBox.Enabled = $true
+        $vSyncTransitionBox.Enabled = $true
+    } else {
+        $vSyncButton.Text = 'V-Sync: Off'
+        $vSyncButton.BackColor = $script:ThemeSurfaceRaised
+        $vSyncButton.FlatAppearance.BorderColor = $script:ThemeBorder
+        $vSyncButton.ForeColor = [System.Drawing.Color]::White
+        $updatesPerSecondBox.Enabled = $true
+        $vSyncIntervalBox.Enabled = $false
+        $vSyncTransitionBox.Enabled = $false
+    }
+}
+
+function Update-DropModeUI {
+    if ($script:DropModeEnabled) {
+        $dropModeButton.Text = 'Drop mode: On'
+        $dropModeButton.BackColor = [System.Drawing.Color]::FromArgb(86, 57, 24)
+        $dropModeButton.FlatAppearance.BorderColor = $script:ThemeWarning
+    } else {
+        $dropModeButton.Text = 'Drop mode: Off'
+        $dropModeButton.BackColor = $script:ThemeSurfaceRaised
+        $dropModeButton.FlatAppearance.BorderColor = $script:ThemeBorder
+    }
+}
+
+$updatesPerSecondBox.Add_ValueChanged({
+    Update-VSyncUI
+})
+
+$vSyncIntervalBox.Add_ValueChanged({
+    $script:VSyncIntervalMs = [int]$vSyncIntervalBox.Value
+    Update-VSyncUI
+    if ($script:Connected -and $script:VSyncEnabled) {
+        try { Configure-TVVSync } catch {
+            Set-Status "Could not change the V-Sync interval: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+        }
+    }
+    Save-Config
+})
+
+$vSyncTransitionBox.Add_ValueChanged({
+    $script:VSyncTransitionMs = [int]$vSyncTransitionBox.Value
+    Update-VSyncUI
+    if ($script:Connected -and $script:VSyncEnabled) {
+        try { Configure-TVVSync } catch {
+            Set-Status "Could not change the V-Sync transition time: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+        }
+    }
+    Save-Config
+})
+
+$screenPreview.Add_Paint({
+    param($sender, $eventArgs)
+    try {
+        $graphics = $eventArgs.Graphics
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $gridPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(24, 62, 211, 238), 1)
+        $framePen = New-Object System.Drawing.Pen($script:ThemeBorder, 1)
+        try {
+            for ($gridX = 160; $gridX -lt 640; $gridX += 160) { $graphics.DrawLine($gridPen, $gridX, 0, $gridX, 360) }
+            for ($gridY = 90; $gridY -lt 360; $gridY += 90) { $graphics.DrawLine($gridPen, 0, $gridY, 640, $gridY) }
+            $graphics.DrawRectangle($framePen, 0, 0, 639, 359)
+        } finally { $gridPen.Dispose(); $framePen.Dispose() }
+
+        if ($script:MediaItems.Count -eq 0) {
+            $font = New-Object System.Drawing.Font('Consolas', 12)
+            $brush = New-Object System.Drawing.SolidBrush($script:ThemeMuted)
+            try { $graphics.DrawString('ADD MEDIA TO BEGIN', $font, $brush, 215, 166) }
+            finally { $font.Dispose(); $brush.Dispose() }
+            return
+        }
+
+        $shadowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(100, 0, 0, 0))
+        $selectedBorderPen = New-Object System.Drawing.Pen($script:ThemeAccent, 2)
+        $normalBorderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(135, 126, 145, 171), 1)
+        $handleBrush = New-Object System.Drawing.SolidBrush($script:ThemeAccent)
+        $handlePen = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 2)
+        $deleteBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(185, 244, 76, 106))
+        $buttonBorder = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(225, 255, 255, 255), 1.5)
+        $buttonFont = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+        $buttonTextBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+        $buttonFormat = New-Object System.Drawing.StringFormat
+        $buttonFormat.Alignment = [System.Drawing.StringAlignment]::Center
+        $buttonFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+        try {
+            foreach ($item in @($script:MediaItems)) {
+                $rect = Get-MediaItemRectangle $item
+                $shadow = [System.Drawing.RectangleF]::new(
+                    [single]($rect.X + 5), [single]($rect.Y + 5),
+                    [single]$rect.Width, [single]$rect.Height)
+                $graphics.FillRectangle($shadowBrush, $shadow)
+                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $graphics.DrawImage($item.Image, $rect)
+                $isSelected = [object]::ReferenceEquals($item, $script:SelectedMediaItem)
+                $graphics.DrawRectangle($(if ($isSelected) { $selectedBorderPen } else { $normalBorderPen }),
+                    $rect.X, $rect.Y, $rect.Width, $rect.Height)
+
+                $deleteRectangle = Get-DeleteRectangle $item
+                $graphics.FillEllipse($deleteBrush, $deleteRectangle)
+                $graphics.DrawEllipse($buttonBorder, $deleteRectangle)
+                $graphics.DrawString('×', $buttonFont, $buttonTextBrush, $deleteRectangle, $buttonFormat)
+
+                if ($item.Kind -eq 'video') {
+                    $muteRectangle = Get-VideoMuteRectangle $item
+                    $muteBrush = New-Object System.Drawing.SolidBrush(
+                    $(if ($item.VideoMuted) {
+                        [System.Drawing.Color]::FromArgb(225, 185, 55, 55)
+                    } else {
+                        [System.Drawing.Color]::FromArgb(225, 35, 42, 52)
+                    }))
+                    try {
+                        $graphics.FillEllipse($muteBrush, $muteRectangle)
+                        $graphics.DrawEllipse($buttonBorder, $muteRectangle)
+                        $muteText = if ($item.VideoMuted) { 'OFF' } else { 'VOL' }
+                        $graphics.DrawString($muteText, $buttonFont, $buttonTextBrush, $muteRectangle, $buttonFormat)
+                    } finally { $muteBrush.Dispose() }
+                }
+
+                if ($isSelected) {
+                    $handleRadius = 7.0
+                    $handleDiameter = $handleRadius * 2.0
+                    foreach ($point in @(
+                        @($rect.Left, $rect.Top), @($rect.Right, $rect.Top),
+                        @($rect.Left, $rect.Bottom), @($rect.Right, $rect.Bottom))) {
+                        $handleX = [single]([double]$point[0] - $handleRadius)
+                        $handleY = [single]([double]$point[1] - $handleRadius)
+                        $graphics.FillEllipse($handleBrush, $handleX, $handleY, [single]$handleDiameter, [single]$handleDiameter)
+                        $graphics.DrawEllipse($handlePen, $handleX, $handleY, [single]$handleDiameter, [single]$handleDiameter)
+                    }
+                }
+            }
+        } finally {
+            $shadowBrush.Dispose()
+            $selectedBorderPen.Dispose()
+            $normalBorderPen.Dispose()
+            $handleBrush.Dispose()
+            $handlePen.Dispose()
+            $deleteBrush.Dispose()
+            $buttonBorder.Dispose()
+            $buttonFont.Dispose()
+            $buttonTextBrush.Dispose()
+            $buttonFormat.Dispose()
+        }
+    } catch {
+        # WinForms otherwise opens an intrusive JIT dialog for an exception in Paint.
+        $script:LastPaintError = $_.Exception.Message
+        try {
+            $errorFont = New-Object System.Drawing.Font('Segoe UI', 11)
+            $errorBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 220, 225, 235))
+            try { $eventArgs.Graphics.DrawString('Preview rendering failed.', $errorFont, $errorBrush, 205, 165) }
+            finally { $errorFont.Dispose(); $errorBrush.Dispose() }
+        } catch { }
+    }
+})
+
+$screenPreview.Add_MouseDown({
+    param($sender, $eventArgs)
+    if ($eventArgs.Button -ne [System.Windows.Forms.MouseButtons]::Left -or $script:MediaItems.Count -eq 0) { return }
+    for ($index = $script:MediaItems.Count - 1; $index -ge 0; $index--) {
+        $hitItem = $script:MediaItems[$index]
+        $deleteRectangle = Get-DeleteRectangle $hitItem
+        if ($deleteRectangle.Contains([single]$eventArgs.X, [single]$eventArgs.Y)) {
+            Remove-MediaItem $hitItem
+            return
+        }
+        $muteRectangle = Get-VideoMuteRectangle $hitItem
+        if (-not $muteRectangle.IsEmpty -and $muteRectangle.Contains([single]$eventArgs.X, [single]$eventArgs.Y)) {
+            Select-MediaItem $hitItem
+            Toggle-VideoMute
+            return
+        }
+    }
+    $resizeHandle = Get-ResizeHandle $eventArgs.X $eventArgs.Y
+    if (Start-PreviewResize $resizeHandle) {
+        $screenPreview.Capture = $true
+        $screenPreview.Cursor = Get-PreviewCursor $eventArgs.X $eventArgs.Y
+        Notify-MotionStart
+        return
+    }
+    $hitItem = Get-MediaItemAtPoint $eventArgs.X $eventArgs.Y
+    if ($null -ne $hitItem) { Select-MediaItem $hitItem }
+    if (Start-PreviewDrag $eventArgs.X $eventArgs.Y) {
+        $screenPreview.Capture = $true
+        $screenPreview.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+        Notify-MotionStart
+    }
+})
+
+$screenPreview.Add_MouseMove({
+    param($sender, $eventArgs)
+    if ($script:Resizing) {
+        [void](Update-PreviewResize $eventArgs.X $eventArgs.Y)
+        return
+    }
+    if ($script:Dragging) {
+        [void](Update-PreviewDrag $eventArgs.X $eventArgs.Y)
+        return
+    }
+    $screenPreview.Cursor = Get-PreviewCursor $eventArgs.X $eventArgs.Y
+})
+
+$screenPreview.Add_MouseUp({
+    param($sender, $eventArgs)
+    if ($script:Dragging -or $script:Resizing) {
+        $script:Dragging = $false
+        $script:Resizing = $false
+        $script:ResizeCorner = ''
+        $screenPreview.Capture = $false
+        $screenPreview.Cursor = Get-PreviewCursor $eventArgs.X $eventArgs.Y
+        Save-Config
+        Queue-FinalMove
+    }
+})
+
+$screenPreview.Add_MouseLeave({
+    if (-not $script:Dragging -and -not $script:Resizing) { $screenPreview.Cursor = [System.Windows.Forms.Cursors]::Default }
+})
+
+$screenPreview.Add_MouseEnter({ $screenPreview.Focus() })
+$screenPreview.Add_MouseWheel({
+    param($sender, $eventArgs)
+    $step = if ($eventArgs.Delta -gt 0) { 3 } else { -3 }
+    $script:OverlaySize = [Math]::Max(1, [Math]::Min(100, $script:OverlaySize + $step))
+    Sync-SelectedMediaItem
+    Clamp-OverlayPosition
+    Mark-PositionDirty
+    $screenPreview.Invalidate()
+    if ($script:Connected) { Pump-MoveStream $false }
+    Queue-FinalMove
+})
+
+$opacitySlider.Add_ValueChanged({
+    $opacityValue.Text = "$($opacitySlider.Value)"
+    if ($script:ChangingSelection) { $screenPreview.Invalidate(); return }
+    Mark-PositionDirty
+    if ($script:Connected) { Pump-MoveStream $false }
+})
+$opacitySlider.Add_MouseUp({ Queue-FinalMove })
+
+$topLeftButton.Add_Click({ Move-Preset 'left' 'top' })
+$topRightButton.Add_Click({ Move-Preset 'right' 'top' })
+$centerButton.Add_Click({ Move-Preset 'center' 'center' })
+$bottomLeftButton.Add_Click({ Move-Preset 'left' 'bottom' })
+$bottomRightButton.Add_Click({ Move-Preset 'right' 'bottom' })
+
+$browseButton.Add_Click({
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Select images, GIFs, or videos'
+    $dialog.Filter = 'Supported media|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.mp4;*.m4v;*.webm;*.mkv;*.3gp|Images and GIFs|*.png;*.jpg;*.jpeg;*.bmp;*.gif|Videos|*.mp4;*.m4v;*.webm;*.mkv;*.3gp|All files|*.*'
+    $dialog.Multiselect = $true
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            foreach ($selectedMedia in $dialog.FileNames) { [void](Add-MediaItem $selectedMedia $true) }
+            if ($script:BroadcastEnabled) {
+                Set-Status "Added and sent $($dialog.FileNames.Count) file(s) to the TV." ([System.Drawing.Color]::FromArgb(55, 125, 80))
+            } else {
+                Set-Status "Added $($dialog.FileNames.Count) file(s) to the preview. Enable broadcasting to show them on the TV." ([System.Drawing.Color]::FromArgb(70, 78, 92))
+            }
+        } catch {
+            Set-Status "Could not open the media file: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+        }
+    }
+    $dialog.Dispose()
+})
+
+$addAudioButton.Add_Click({
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Add audio files to the library'
+    $dialog.Filter = 'Audio files|*.mp3;*.m4a;*.aac;*.ogg;*.wav;*.flac|All files|*.*'
+    $dialog.Multiselect = $true
+    if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        foreach ($selectedAudio in $dialog.FileNames) {
+            if (@($script:AudioLibrary) -notcontains $selectedAudio) {
+                [void]$script:AudioLibrary.Add($selectedAudio)
+            }
+        }
+        Refresh-AudioLibraryUI
+        Save-Config
+        Set-Status "Added $($dialog.FileNames.Count) file(s) to the audio library." ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    }
+    $dialog.Dispose()
+})
+
+$globalMuteButton.Add_Click({ Toggle-GlobalMute })
+$stopAudioButton.Add_Click({ Stop-AudioTrack })
+
+$checkButton.Add_Click({
+    Set-Status 'Opening the ADB tunnel.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    try {
+        Open-AdbTunnel
+        Ensure-TVReceiver
+        Set-Status 'TV connected. The overlay receiver is ready.' ([System.Drawing.Color]::FromArgb(55, 125, 80))
+    } catch {
+        Set-Status "Connection failed: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    } finally {
+        if (-not $script:Connected) { Close-AdbTunnel }
+    }
+})
+
+$vSyncButton.Add_Click({
+    $script:VSyncEnabled = -not $script:VSyncEnabled
+    $script:MoveNextAllowedAt = 0L
+    Update-VSyncUI
+    try {
+        if ($script:Connected) { Configure-TVVSync }
+        $modeText = if ($script:VSyncEnabled) {
+            "V-Sync enabled. Target interval: $($script:VSyncIntervalMs) ms; transition: $($script:VSyncTransitionMs) ms."
+        } else {
+            'V-Sync disabled. Position updates are applied directly.'
+        }
+        Set-Status $modeText ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    } catch {
+        Set-Status "Could not change V-Sync: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+    Save-Config
+})
+
+$dropModeButton.Add_Click({
+    $script:DropModeEnabled = -not $script:DropModeEnabled
+    Update-DropModeUI
+    $modeText = if ($script:DropModeEnabled) {
+        'Drop mode enabled. The final position is sent when the mouse button is released.'
+    } else {
+        'Drop mode disabled. Position updates are sent while dragging.'
+    }
+    Set-Status $modeText ([System.Drawing.Color]::FromArgb(70, 78, 92))
+    Save-Config
+})
+
+$mediaControlButton.Add_Click({
+    if (-not $script:Connected -or -not $script:OverlayActive -or $script:MediaKind -ne 'video' -or
+        $null -eq $script:SelectedMediaItem -or -not $script:SelectedMediaItem.RemoteVisible) {
+        Set-Status 'Video controls are available after a video layer starts playing.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+        return
+    }
+    try {
+        if ($script:VideoPaused) {
+            Send-Request 'POST' "/play?id=$($script:SelectedMediaItem.Id)" | Out-Null
+            $script:VideoPaused = $false
+            Sync-SelectedMediaItem
+            Set-Status 'Video playback resumed.' ([System.Drawing.Color]::FromArgb(55, 125, 80))
+        } else {
+            Send-Request 'POST' "/pause?id=$($script:SelectedMediaItem.Id)" | Out-Null
+            $script:VideoPaused = $true
+            Sync-SelectedMediaItem
+            Set-Status 'Video playback paused. Broadcasting remains active.' ([System.Drawing.Color]::FromArgb(70, 78, 92))
+        }
+    } catch {
+        Set-Status "Could not control video playback: $($_.Exception.Message)" ([System.Drawing.Color]::Firebrick)
+    }
+})
+
+$broadcastButton.Add_Click({ Set-BroadcastEnabled (-not $script:BroadcastEnabled) })
+
+$form.Add_Shown({
+    if ($env:MIRROR_TO_TV_SELFTEST -ne '1' -and $env:MIRROR_TO_TV_CONNECTION_TEST -ne '1' -and
+        (Test-Path -LiteralPath $script:ConfigPath)) {
+        try {
+            $saved = Get-Content -Raw -LiteralPath $script:ConfigPath | ConvertFrom-Json
+            if ($saved.tvIp) { $ipBox.Text = [string]$saved.tvIp }
+            if ($saved.adbPort) { $adbPortBox.Value = [decimal]$saved.adbPort }
+            if ($saved.size) { $script:OverlaySize = [Math]::Max(1, [Math]::Min(100, [int]$saved.size)) }
+            if ($null -ne $saved.opacity) { $opacitySlider.Value = [int]$saved.opacity }
+            if ($null -ne $saved.x) { $script:OverlayX = [double]$saved.x }
+            if ($null -ne $saved.y) { $script:OverlayY = [double]$saved.y }
+            if ($null -ne $saved.dropModeEnabled) { $script:DropModeEnabled = [bool]$saved.dropModeEnabled }
+            if ($null -ne $saved.updatesPerSecond) {
+                $savedRate = [Math]::Max($updatesPerSecondBox.Minimum,
+                    [Math]::Min($updatesPerSecondBox.Maximum, [int]$saved.updatesPerSecond))
+                $updatesPerSecondBox.Value = $savedRate
+            }
+            if ($null -ne $saved.vSyncEnabled) { $script:VSyncEnabled = [bool]$saved.vSyncEnabled }
+            if ($null -ne $saved.vSyncIntervalMs) {
+                $script:VSyncIntervalMs = [Math]::Max([int]$vSyncIntervalBox.Minimum,
+                    [Math]::Min([int]$vSyncIntervalBox.Maximum, [int]$saved.vSyncIntervalMs))
+                $vSyncIntervalBox.Value = $script:VSyncIntervalMs
+            }
+            if ($null -ne $saved.vSyncTransitionMs) {
+                $script:VSyncTransitionMs = [Math]::Max([int]$vSyncTransitionBox.Minimum,
+                    [Math]::Min([int]$vSyncTransitionBox.Maximum, [int]$saved.vSyncTransitionMs))
+                $vSyncTransitionBox.Value = $script:VSyncTransitionMs
+            }
+            if ($null -ne $saved.globalMuted) { $script:GlobalMuted = [bool]$saved.globalMuted }
+            if ($null -ne $saved.videoMuted) { $script:VideoMuted = [bool]$saved.videoMuted }
+            if ($null -ne $saved.audioLibrary) {
+                $script:AudioLibrary.Clear()
+                foreach ($savedAudio in @($saved.audioLibrary)) {
+                    $savedAudioPath = [string]$savedAudio
+                    $alreadyPresent = @($script:AudioLibrary) -contains $savedAudioPath
+                    if ((-not [string]::IsNullOrWhiteSpace($savedAudioPath)) -and (-not $alreadyPresent)) {
+                        [void]$script:AudioLibrary.Add($savedAudioPath)
+                    }
+                }
+            }
+            if ($saved.lastImage -and (Test-Path -LiteralPath ([string]$saved.lastImage) -PathType Leaf)) {
+                $fileBox.Text = [string]$saved.lastImage
+                Load-SelectedMedia $fileBox.Text $false
+            }
+        } catch { }
+    }
+    Update-DropModeUI
+    Update-VSyncUI
+    Update-GlobalMuteUI
+    Refresh-AudioLibraryUI
+    Clamp-OverlayPosition
+    $screenPreview.Invalidate()
+    $browseButton.Focus()
+})
+
+$form.Add_FormClosing({
+    $script:Closing = $true
+    Save-Config
+    if ($script:Connected) { Hide-And-Disconnect $true }
+    else { Close-AdbTunnel }
+    $heartbeat.Stop()
+    $heartbeat.Dispose()
+    $positionStreamTimer.Stop()
+    $positionStreamTimer.Dispose()
+    Reset-MoveStream
+    $moveHttp.Dispose()
+    $http.Dispose()
+    foreach ($item in @($script:MediaItems)) {
+        if ($null -ne $item.Image) { $item.Image.Dispose() }
+    }
+})
+
+if ($env:MIRROR_TO_TV_CONNECTION_TEST -eq '1') {
+    [void]$form.CreateControl()
+    [void]$screenPreview.CreateControl()
+    $script:BroadcastEnabled = $true
+    Update-BroadcastUI
+    try {
+        if ($env:MIRROR_TO_TV_VSYNC_TEST -eq '1') {
+            $script:VSyncEnabled = $true
+            $script:VSyncIntervalMs = 500
+            $script:VSyncTransitionMs = 250
+            $vSyncIntervalBox.Value = 500
+            $vSyncTransitionBox.Value = 250
+            Update-VSyncUI
+        }
+        Open-AdbTunnel
+        Ensure-TVReceiver
+        if ($env:MIRROR_TO_TV_AUDIO_TEST -and (Test-Path -LiteralPath $env:MIRROR_TO_TV_AUDIO_TEST -PathType Leaf)) {
+            [void]$script:AudioLibrary.Add($env:MIRROR_TO_TV_AUDIO_TEST)
+            Refresh-AudioLibraryUI
+            $audioTestRow = $audioLibraryFlow.Controls[0]
+            $audioTestPlay = $audioTestRow.Controls | Where-Object {
+                $_ -is [System.Windows.Forms.Button] -and $_.Text -eq '▶'
+            } | Select-Object -First 1
+            if ($null -eq $audioTestPlay) { throw 'AUDIO_TEST_PLAY_BUTTON_MISSING' }
+            Play-AudioTrack $env:MIRROR_TO_TV_AUDIO_TEST
+            Start-Sleep -Milliseconds 300
+            $audioPlayingStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+            if (-not $script:AudioSessionActive -or -not $audioPlayingStatus.audioPlaying) {
+                throw "AUDIO_TEST_PLAY_FAILED connected=$script:Connected session=$script:AudioSessionActive tv=$($audioPlayingStatus.audioPlaying) status=$($statusLabel.Text)"
+            }
+            if ($script:GlobalMuted) { Toggle-GlobalMute }
+            Toggle-GlobalMute
+            $audioMutedStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+            if (-not $audioMutedStatus.globalMuted -or -not $audioMutedStatus.audioPlaying) {
+                throw 'AUDIO_TEST_GLOBAL_MUTE_FAILED'
+            }
+            Toggle-GlobalMute
+            if (-not $env:MIRROR_TO_TV_MEDIA_TEST) {
+                Stop-AudioTrack
+                $audioStoppedStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+                if ($audioStoppedStatus.audioActive) { throw 'AUDIO_TEST_STOP_FAILED' }
+            }
+            $script:AudioLibrary.Clear()
+            Refresh-AudioLibraryUI
+            $audioStopResult = if ($env:MIRROR_TO_TV_MEDIA_TEST) { 'deferred' } else { 'true' }
+            Write-Output "AUDIO_DESKTOP_TEST_OK library=1 play=true globalMute=true stop=$audioStopResult"
+        }
+        if ($env:MIRROR_TO_TV_MEDIA_TEST -and (Test-Path -LiteralPath $env:MIRROR_TO_TV_MEDIA_TEST -PathType Leaf)) {
+            $fileBox.Text = $env:MIRROR_TO_TV_MEDIA_TEST
+            Load-SelectedMedia $env:MIRROR_TO_TV_MEDIA_TEST
+            if ($env:MIRROR_TO_TV_VIDEO_MUTED_TEST -eq '1') { $script:VideoMuted = $true }
+            Send-CurrentMedia $false
+            if (-not $script:Connected) { throw 'MEDIA_TEST_SHOW_FAILED' }
+            $primaryTestItem = $script:SelectedMediaItem
+            if ($env:MIRROR_TO_TV_MEDIA_TEST_2 -and (Test-Path -LiteralPath $env:MIRROR_TO_TV_MEDIA_TEST_2 -PathType Leaf)) {
+                $secondTestItem = Add-MediaItem $env:MIRROR_TO_TV_MEDIA_TEST_2 $true
+                $multiStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+                if ($multiStatus.mediaCount -ne 2 -or -not $secondTestItem.RemoteVisible) {
+                    throw "MULTI_MEDIA_TRANSMIT_FAILED count=$($multiStatus.mediaCount) remote=$($secondTestItem.RemoteVisible)"
+                }
+                Remove-MediaItem $secondTestItem
+                $afterRemoveStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+                if ($afterRemoveStatus.mediaCount -ne 1) { throw "MULTI_MEDIA_REMOTE_REMOVE_FAILED count=$($afterRemoveStatus.mediaCount)" }
+                Select-MediaItem $primaryTestItem
+                Write-Output 'MULTI_MEDIA_CONNECTION_TEST_OK add=2 remove-one=ok'
+            }
+            if ($env:MIRROR_TO_TV_VIDEO_MUTED_TEST -eq '1') {
+                $combinedAudioStatus = (Send-Request 'GET' '/status') | ConvertFrom-Json
+                if (-not $combinedAudioStatus.videoMuted -or -not $combinedAudioStatus.audioPlaying) {
+                    throw "COMBINED_AUDIO_VIDEO_FAILED videoMuted=$($combinedAudioStatus.videoMuted) audioPlaying=$($combinedAudioStatus.audioPlaying)"
+                }
+                Write-Output 'COMBINED_AUDIO_VIDEO_OK videoMuted=true libraryAudio=true'
+            }
+            Notify-MotionStart
+            $script:OverlayX = 0.12
+            $script:OverlayY = 0.18
+            $script:PositionDirty = $true
+            Send-MoveUpdate $false
+            if ($script:PositionDirty) { throw 'MEDIA_TEST_MOVE_FAILED' }
+            if ($script:VSyncEnabled) { Start-Sleep -Milliseconds 120 }
+
+            if ($env:MIRROR_TO_TV_STREAM_TEST -eq '1') {
+                Write-Output 'STREAM_STAGE begin'
+                function Wait-TestMoveIdle([int]$TimeoutMs) {
+                    $deadline = (Get-MonotonicMilliseconds) + $TimeoutMs
+                    while ((Get-MonotonicMilliseconds) -lt $deadline) {
+                        Pump-MoveStream $script:ForceMovePending
+                        [System.Windows.Forms.Application]::DoEvents()
+                        if ($null -eq $script:MoveTask -and -not $script:PositionDirty) { return }
+                        Start-Sleep -Milliseconds 10
+                    }
+                    throw 'MOVE_QUEUE_TIMEOUT'
+                }
+
+                $script:DropModeEnabled = $false
+                $script:VSyncEnabled = $false
+                $updatesPerSecondBox.Value = 30
+                Configure-TVVSync
+                Write-Output 'STREAM_STAGE normal'
+                $normalStarted = $script:MoveRequestsStarted
+                $script:MoveRequestTimes = @()
+                $normalDeadline = (Get-MonotonicMilliseconds) + 650
+                $normalStep = 0
+                while ((Get-MonotonicMilliseconds) -lt $normalDeadline) {
+                    $normalStep++
+                    $script:OverlayX = 0.10 + (($normalStep % 40) / 100.0)
+                    Mark-PositionDirty
+                    Pump-MoveStream $false
+                    [System.Windows.Forms.Application]::DoEvents()
+                    Start-Sleep -Milliseconds 10
+                }
+                $script:OverlayX = 0.63
+                Mark-PositionDirty
+                Queue-FinalMove
+                Wait-TestMoveIdle 5000
+                $normalCount = $script:MoveRequestsStarted - $normalStarted
+                if ($normalCount -lt 8 -or $normalCount -gt 25) {
+                    throw "NORMAL_RATE_FAILED count=$normalCount successes=$script:MoveRequestsSucceeded failures=$script:MoveFailures times=$($script:MoveRequestTimes -join ',')"
+                }
+
+                $script:DropModeEnabled = $true
+                Write-Output "STREAM_STAGE drop normal=$normalCount"
+                $dropStarted = $script:MoveRequestsStarted
+                foreach ($dropX in 0.20, 0.30, 0.40, 0.50) {
+                    $script:OverlayX = $dropX
+                    Mark-PositionDirty
+                    Pump-MoveStream $false
+                    [System.Windows.Forms.Application]::DoEvents()
+                    Start-Sleep -Milliseconds 40
+                }
+                if ($script:MoveRequestsStarted -ne $dropStarted) { throw 'DROP_SENT_BEFORE_RELEASE' }
+                Queue-FinalMove
+                Wait-TestMoveIdle 5000
+                $dropCount = $script:MoveRequestsStarted - $dropStarted
+                if ($dropCount -ne 1) { throw "DROP_FINAL_COUNT_FAILED count=$dropCount" }
+
+                $script:DropModeEnabled = $false
+                Write-Output "STREAM_STAGE vsync drop=$dropCount"
+                $script:VSyncEnabled = $true
+                $script:VSyncIntervalMs = 500
+                $script:VSyncTransitionMs = 250
+                Configure-TVVSync
+                $vSyncConfiguration = (Send-Request 'GET' '/status') | ConvertFrom-Json
+                if (-not $vSyncConfiguration.vSync -or $vSyncConfiguration.vSyncIntervalMs -ne 500 -or
+                    $vSyncConfiguration.vSyncTransitionMs -ne 250) {
+                    throw "VSYNC_CONFIGURATION_FAILED interval=$($vSyncConfiguration.vSyncIntervalMs) transition=$($vSyncConfiguration.vSyncTransitionMs)"
+                }
+                $vSyncStarted = $script:MoveRequestsStarted
+                $vSyncDeadline = (Get-MonotonicMilliseconds) + 1150
+                $vSyncStep = 0
+                while ((Get-MonotonicMilliseconds) -lt $vSyncDeadline) {
+                    $vSyncStep++
+                    $script:OverlayX = 0.20 + (($vSyncStep % 30) / 100.0)
+                    Mark-PositionDirty
+                    Pump-MoveStream $false
+                    [System.Windows.Forms.Application]::DoEvents()
+                    Start-Sleep -Milliseconds 20
+                }
+                $script:OverlayX = 0.71
+                Mark-PositionDirty
+                Queue-FinalMove
+                Wait-TestMoveIdle 5000
+                $vSyncCount = $script:MoveRequestsStarted - $vSyncStarted
+                if ($vSyncCount -lt 2 -or $vSyncCount -gt 5) { throw "VSYNC_RATE_FAILED count=$vSyncCount" }
+                Write-Output "STREAM_TEST_OK normal=$normalCount drop=$dropCount vsync=$vSyncCount successes=$script:MoveRequestsSucceeded"
+                Start-Sleep -Milliseconds 650
+            }
+        }
+        $connectionStatus = Send-Request 'GET' '/status'
+        if ($env:MIRROR_TO_TV_STREAM_TEST -eq '1') {
+            $parsedStatus = $connectionStatus | ConvertFrom-Json
+            if ([Math]::Abs([int]$parsedStatus.x - 710) -gt 2) {
+                throw "STREAM_FINAL_POSITION_FAILED x=$($parsedStatus.x)"
+            }
+        }
+        Write-Output "CONNECTION_TEST_OK $connectionStatus"
+        if ($script:Connected) {
+            Send-Request 'POST' '/hide' | Out-Null
+            Send-Request 'POST' '/stop-audio' | Out-Null
+            $script:Connected = $false
+            $script:OverlayActive = $false
+            $script:AudioSessionActive = $false
+        }
+    } finally {
+        Close-AdbTunnel
+        $heartbeat.Dispose()
+        $positionStreamTimer.Dispose()
+        Reset-MoveStream
+        $moveHttp.Dispose()
+        $http.Dispose()
+        $form.Dispose()
+    }
+    return
+}
+
+if ($env:MIRROR_TO_TV_SELFTEST -eq '1') {
+    [void]$form.CreateControl()
+    [void]$screenPreview.CreateControl()
+    $selfTestImagePath = $env:MIRROR_TO_TV_TEST_IMAGE
+    if ([string]::IsNullOrWhiteSpace($selfTestImagePath) -or
+        -not (Test-Path -LiteralPath $selfTestImagePath -PathType Leaf)) {
+        $selfTestImagePath = Join-Path $PSScriptRoot 'mirror-to-tv-icon.png'
+        if (-not (Test-Path -LiteralPath $selfTestImagePath -PathType Leaf)) {
+            $selfTestImagePath = $null
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($selfTestImagePath)) { throw 'SELFTEST_IMAGE_NOT_FOUND' }
+    $fileBox.Text = $selfTestImagePath
+    Load-SelectedMedia $selfTestImagePath
+    Clamp-OverlayPosition
+    $testRectangle = Get-OverlayRectangle
+    $dragResult = 'not-run'
+    $resizeResult = 'not-run'
+    if ($null -ne $script:CurrentImage) {
+        $script:OverlayX = 0.40
+        $script:OverlayY = 0.30
+        Clamp-OverlayPosition
+        $dragRectangle = Get-OverlayRectangle
+        $dragStartX = $dragRectangle.X + ($dragRectangle.Width / 2.0)
+        $dragStartY = $dragRectangle.Y + ($dragRectangle.Height / 2.0)
+        $beforeDragX = $script:OverlayX
+        $beforeDragY = $script:OverlayY
+        if (-not (Start-PreviewDrag $dragStartX $dragStartY)) { throw 'DRAG_START_FAILED' }
+        if (-not (Update-PreviewDrag ($dragStartX - 40) ($dragStartY + 30))) { throw 'DRAG_MOVE_FAILED' }
+        $script:Dragging = $false
+        if ([Math]::Abs($script:OverlayX - ($beforeDragX - (40.0 / 640.0))) -gt 0.002) { throw 'DRAG_X_FAILED' }
+        if ([Math]::Abs($script:OverlayY - ($beforeDragY + (30.0 / 360.0))) -gt 0.002) { throw 'DRAG_Y_FAILED' }
+        $dragResult = 'ok'
+
+        $script:OverlaySize = 25
+        $script:OverlayX = 0.30
+        $script:OverlayY = 0.20
+        Clamp-OverlayPosition
+        $resizeRectangle = Get-OverlayRectangle
+        $resizeHandle = Get-ResizeHandle $resizeRectangle.Right $resizeRectangle.Bottom
+        if ($resizeHandle -ne 'bottom-right') { throw 'RESIZE_HANDLE_FAILED' }
+        $beforeResize = $script:OverlaySize
+        if (-not (Start-PreviewResize $resizeHandle)) { throw 'RESIZE_START_FAILED' }
+        if (-not (Update-PreviewResize ($resizeRectangle.Right + 70) ($resizeRectangle.Bottom + (70 / $script:ImageAspect)))) {
+            throw 'RESIZE_MOVE_FAILED'
+        }
+        $script:Resizing = $false
+        $script:ResizeCorner = ''
+        if ($script:OverlaySize -le $beforeResize) { throw 'RESIZE_GROW_FAILED' }
+        $resizeResult = 'ok'
+    }
+
+    $opacitySlider.Value = 0
+    if ($opacitySlider.Value -ne 0) { throw 'OPACITY_ZERO_FAILED' }
+    if ($opacitySlider.Orientation -ne [System.Windows.Forms.Orientation]::Vertical -or
+        -not $opacityPanel.Controls.Contains($eyeIcon)) { throw 'VERTICAL_OPACITY_UI_FAILED' }
+    if ($null -ne (Get-Variable -Name hint -Scope Script -ErrorAction SilentlyContinue)) {
+        throw 'VSYNC_HINT_STILL_VISIBLE'
+    }
+    $script:OverlaySize = 100
+    if ($script:OverlaySize -ne 100) { throw 'SIZE_MAX_FAILED' }
+    $updatesPerSecondBox.Value = 120
+    if ([Math]::Abs((Get-DesiredMoveIntervalMs) - (1000.0 / 120.0)) -gt 0.001) { throw 'RATE_MAX_FAILED' }
+    $updatesPerSecondBox.Value = 10
+    if ((Get-DesiredMoveIntervalMs) -ne 100) { throw 'RATE_MIN_FAILED' }
+    if ($script:DropModeEnabled) { throw 'DROP_DEFAULT_FAILED' }
+    $script:DropModeEnabled = $true
+    Update-DropModeUI
+    if ($dropModeButton.Text -ne 'Drop mode: On') { throw 'DROP_UI_ON_FAILED' }
+    $script:DropModeEnabled = $false
+    Update-DropModeUI
+    $script:VSyncEnabled = $true
+    $script:VSyncIntervalMs = 375
+    $script:VSyncTransitionMs = 225
+    $vSyncIntervalBox.Value = 375
+    $vSyncTransitionBox.Value = 225
+    Update-VSyncUI
+    if ((Get-DesiredMoveIntervalMs) -ne 375 -or $updatesPerSecondBox.Enabled -or
+        -not $vSyncTransitionBox.Enabled -or $script:VSyncTransitionMs -ne 225) {
+        throw 'VSYNC_CUSTOM_FAILED'
+    }
+    $script:VSyncIntervalMs = 1735
+    $vSyncIntervalBox.Value = 1735
+    Update-VSyncUI
+    if ((Get-DesiredMoveIntervalMs) -ne 1735) { throw 'VSYNC_CUSTOM_2_FAILED' }
+    $script:VSyncEnabled = $false
+    Update-VSyncUI
+    if (-not $updatesPerSecondBox.Enabled -or (Get-DesiredMoveIntervalMs) -ne 100) { throw 'VSYNC_OFF_FAILED' }
+
+    if ($script:GlobalMuted) { throw 'GLOBAL_MUTE_DEFAULT_FAILED' }
+    Toggle-GlobalMute $true
+    if (-not $script:GlobalMuted -or $globalMuteButton.Text -ne 'Global audio: Muted') { throw 'GLOBAL_MUTE_ON_FAILED' }
+    Toggle-GlobalMute $true
+    if ($script:GlobalMuted -or $globalMuteButton.Text -ne 'Global audio: On') { throw 'GLOBAL_MUTE_OFF_FAILED' }
+
+    if ($script:BroadcastEnabled -or $broadcastButton.Text -ne 'Broadcast: Off') { throw 'BROADCAST_DEFAULT_FAILED' }
+    $savedMediaKind = $script:MediaKind
+    $savedItemKind = $script:SelectedMediaItem.Kind
+    $script:SelectedMediaItem.Kind = 'video'
+    $script:MediaKind = 'video'
+    $videoMuteRectangle = Get-VideoMuteRectangle
+    if ($videoMuteRectangle.IsEmpty) { throw 'VIDEO_MUTE_RECT_FAILED' }
+    $videoMuteCursor = Get-PreviewCursor ($videoMuteRectangle.X + 2) ($videoMuteRectangle.Y + 2)
+    if ($videoMuteCursor -ne [System.Windows.Forms.Cursors]::Hand) { throw 'VIDEO_MUTE_HIT_FAILED' }
+    $script:VideoMuted = $false
+    Toggle-VideoMute
+    if (-not $script:VideoMuted) { throw 'VIDEO_MUTE_ON_FAILED' }
+    Toggle-VideoMute
+    if ($script:VideoMuted) { throw 'VIDEO_MUTE_OFF_FAILED' }
+    $script:SelectedMediaItem.Kind = $savedItemKind
+    $script:MediaKind = $savedMediaKind
+
+    $secondItem = Add-MediaItem $selfTestImagePath $false
+    $thirdItem = Add-MediaItem $selfTestImagePath $false
+    if ($script:MediaItems.Count -ne 3 -or $secondItem.Id -eq $thirdItem.Id) { throw 'MULTI_MEDIA_ADD_FAILED' }
+    Select-MediaItem $null
+    $thirdItem.Size = 25
+    $thirdItem.X = 0.25
+    $thirdItem.Y = 0.25
+    $thirdRectangle = Get-MediaItemRectangle $thirdItem
+    $deleteRectangle = Get-DeleteRectangle $thirdItem
+    if ($deleteRectangle.IsEmpty -or $deleteRectangle.Width -gt 22.1 -or $deleteRectangle.X -le $thirdRectangle.Right) {
+        throw 'MULTI_MEDIA_DELETE_BUTTON_FAILED'
+    }
+    Remove-MediaItem $thirdItem
+    if ($script:MediaItems.Count -ne 2) { throw 'MULTI_MEDIA_REMOVE_FAILED' }
+    Select-MediaItem $secondItem
+
+    [void]$script:AudioLibrary.Add('C:\test-audio.mp3')
+    Refresh-AudioLibraryUI
+    if ($audioLibraryFlow.Controls.Count -ne 1) { throw 'AUDIO_LIBRARY_ROW_FAILED' }
+    $libraryRow = $audioLibraryFlow.Controls[0]
+    $playControl = $libraryRow.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -eq '▶' } | Select-Object -First 1
+    if ($null -eq $playControl) { throw 'AUDIO_LIBRARY_PLAY_FAILED' }
+    $script:AudioLibrary.Clear()
+    Refresh-AudioLibraryUI
+    Select-MediaItem $null
+    $script:MediaItems[0].Kind = 'image'
+    $script:MediaItems[0].Size = 34
+    $script:MediaItems[0].Opacity = 100
+    $script:MediaItems[0].X = 0.08
+    $script:MediaItems[0].Y = 0.12
+    $secondItem.Kind = 'image'
+    $secondItem.Size = 29
+    $secondItem.Opacity = 100
+    $secondItem.X = 0.56
+    $secondItem.Y = 0.47
+    Select-MediaItem $secondItem
+    $previewRender = [System.Drawing.Bitmap]::new($screenPreview.Width, $screenPreview.Height)
+    try {
+        $previewBounds = [System.Drawing.Rectangle]::new(0, 0, $screenPreview.Width, $screenPreview.Height)
+        $screenPreview.DrawToBitmap($previewRender, $previewBounds)
+    } finally { $previewRender.Dispose() }
+    if ($script:LastPaintError) { throw "PAINT_SELFTEST_FAILED: $script:LastPaintError" }
+    if ($env:MIRROR_TO_TV_RENDER_PATH) {
+        $form.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+        $render = [System.Drawing.Bitmap]::new($form.Width, $form.Height)
+        try {
+            $renderBounds = [System.Drawing.Rectangle]::new(0, 0, $form.Width, $form.Height)
+            $form.DrawToBitmap($render, $renderBounds)
+            $render.Save($env:MIRROR_TO_TV_RENDER_PATH, [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $render.Dispose()
+            $form.Hide()
+        }
+    }
+    Write-Output "SELFTEST_OK controls=$($form.Controls.Count) preview=$([Math]::Round($testRectangle.Width))x$([Math]::Round($testRectangle.Height)) drag=$dragResult resize=$resizeResult design=sci-fi-dark size-state=scalar opacity=vertical-eye multi-media=2 delete=outside-small broadcast=off-default rate=10-120 opacity-range=0-100 drop=off-default vsync=50-10000ms-custom transition=50-5000ms-custom audio-library=ok global-mute=ok video-mute=ok adb=$script:AdbPath"
+    $heartbeat.Dispose()
+    $positionStreamTimer.Dispose()
+    $moveHttp.Dispose()
+    $http.Dispose()
+    $form.Dispose()
+    return
+}
+
+[void]$form.ShowDialog()
+$form.Dispose()
