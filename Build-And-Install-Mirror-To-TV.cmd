@@ -44,7 +44,9 @@ if defined TVIP (
 ) else (
   call "%~dp0dist\mirror-to-tv\Install-Mirror-To-TV.cmd"
 )
-if errorlevel 1 goto install_failed
+set "INSTALL_RESULT=%ERRORLEVEL%"
+if "%INSTALL_RESULT%"=="2" exit /b 0
+if not "%INSTALL_RESULT%"=="0" goto install_failed
 
 echo.
 echo Build and TV update complete.

@@ -59,12 +59,47 @@ if errorlevel 1 (
 )
 
 echo Installing the receiver...
-"%ADB%" -s "%SERIAL%" install -r "%APK%"
-if errorlevel 1 (
-  echo ERROR: APK installation failed.
-  echo If another build is installed with a different signature, uninstall it manually first.
+set "INSTALL_LOG=%TEMP%\mirror-to-tv-install-%RANDOM%-%RANDOM%.log"
+"%ADB%" -s "%SERIAL%" install -r "%APK%" >"!INSTALL_LOG!" 2>&1
+set "INSTALL_RESULT=!ERRORLEVEL!"
+type "!INSTALL_LOG!"
+if "!INSTALL_RESULT!"=="0" (
+  del /q "!INSTALL_LOG!" >nul 2>&1
+  goto install_complete
+)
+
+findstr /c:"INSTALL_FAILED_UPDATE_INCOMPATIBLE" "!INSTALL_LOG!" >nul
+if not errorlevel 1 goto signature_mismatch
+del /q "!INSTALL_LOG!" >nul 2>&1
+echo ERROR: APK installation failed.
+goto disconnect
+
+:signature_mismatch
+del /q "!INSTALL_LOG!" >nul 2>&1
+echo.
+choice /c YN /n /m "The installed app has a different signature. Completely reinstall the app? This removes its existing app data. [Y/N] "
+if errorlevel 2 (
+  echo Installation cancelled. The installed app was not changed.
+  set "EXIT_CODE=2"
+  set "MIRROR_TO_TV_NO_PAUSE=1"
   goto disconnect
 )
+
+echo Removing the installed app...
+"%ADB%" -s "%SERIAL%" uninstall local.lanoverlay.tv
+if errorlevel 1 (
+  echo ERROR: The installed app could not be removed.
+  goto disconnect
+)
+
+echo Installing the fresh receiver...
+"%ADB%" -s "%SERIAL%" install "%APK%"
+if errorlevel 1 (
+  echo ERROR: The old app was removed, but the fresh APK installation failed.
+  goto disconnect
+)
+
+:install_complete
 
 echo Granting permission to display over other apps...
 "%ADB%" -s "%SERIAL%" shell appops set local.lanoverlay.tv SYSTEM_ALERT_WINDOW allow
