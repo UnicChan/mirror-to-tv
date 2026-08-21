@@ -35,6 +35,10 @@ A local-network utility for sending images, animated GIFs, video overlays, and a
 
 The TV and PC must be connected to the same home network.
 
+### Requirements after downloading the release
+
+No additional PC software is required: the APK, ADB, and FFmpeg are included in `mirror-to-tv-1.0.zip`. Enable ADB debugging on the Android TV, find its IP address, and fully extract the archive on a Windows 10 or Windows 11 PC.
+
 ### 1. Prepare the TV
 
 1. Open **Settings → About → Product model** and press the OK button seven times. Xiaomi documents this as the way to reveal developer access on Mi TV and Mi Box ([Xiaomi instructions](https://www.mi.com/uk/support/article/KA-06513/)). On some Android TV or Google TV firmware, the item is named **Build** instead.
@@ -59,6 +63,22 @@ ADB is included in the release archive; Android Studio is not required. Its Apac
 4. Enable broadcasting. The first send may take longer while the desktop prepares transparency; the result is cached until the source or chroma-key settings change.
 
 Images and GIFs are converted to transparent media on the PC. Videos are converted on the PC to an H.264 stream containing the finished color image and alpha mask. The TV uses hardware video decoding and a small GPU shader only to apply that precomputed mask. FFmpeg is included in the release archive, is not installed on the TV, and its license is in `tools/FFMPEG-LICENSE.txt`.
+
+## Building from source
+
+This section is not needed for normal use. To build a release, install or extract:
+
+1. [JDK 17](https://learn.microsoft.com/en-us/java/openjdk/download) to `C:\Tools\jdk-17`.
+2. [Android Studio](https://developer.android.com/studio/install) with the standard Android SDK, Build-Tools, and Platform-Tools. The default SDK location is detected automatically.
+3. [FFmpeg for Windows](https://ffmpeg.org/download.html) to `C:\Tools\ffmpeg`, with the executable at `C:\Tools\ffmpeg\bin\ffmpeg.exe`.
+
+Then run from the project root:
+
+```powershell
+.\build.ps1 -JavaHome 'C:\Tools\jdk-17' -FfmpegPath 'C:\Tools\ffmpeg\bin\ffmpeg.exe'
+```
+
+The release archive is written to `dist`. If the Android SDK is not in its default location, also pass `-AndroidSdk 'path-to-SDK'`.
 
 ## License
 
