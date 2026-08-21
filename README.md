@@ -48,10 +48,10 @@ No additional PC software is required: the APK, ADB, and FFmpeg are included in 
 ### 2. Install and start
 
 1. Download `mirror-to-tv-1.0.zip` from the repository Releases page and extract the entire archive. Do not run it from inside the ZIP.
-2. Run `Install-Mirror-To-TV.cmd`, enter the TV IP address, and keep the default ADB port `5555` unless the TV shows a different port.
+2. Run `Install-Mirror-To-TV.cmd` to install or update the APK. Enter the TV IP address and keep the default ADB port `5555` unless the TV shows a different port.
 3. If an authorization dialog appears on the TV, choose **Always allow from this computer** and then **Allow**.
 
-The installer connects to the TV, installs the APK, grants the overlay permission, starts and verifies the receiver, remembers the TV address, and opens the desktop controller. It does not reboot the TV. For later use, run `Start-Mirror-To-TV.cmd`.
+The installer connects to the TV, installs the APK, grants the overlay permission, starts and verifies the receiver, remembers the TV address, and opens the desktop controller. It does not reboot the TV. To update the APK, run `Install-Mirror-To-TV.cmd` again; it reuses the saved address. For normal use, run `Start-Mirror-To-TV.cmd`.
 
 ADB is included in the release archive; Android Studio is not required. Its Apache 2.0 notices are included in `tools/NOTICE.txt`. If the connection fails, confirm that both devices are on the same non-guest network and that the router does not isolate Wi-Fi clients.
 
@@ -72,13 +72,7 @@ This section is not needed for normal use. To build a release, install or extrac
 2. [Android Studio](https://developer.android.com/studio/install) with the standard Android SDK, Build-Tools, and Platform-Tools. The default SDK location is detected automatically.
 3. [FFmpeg for Windows](https://ffmpeg.org/download.html) to `C:\Tools\ffmpeg`, with the executable at `C:\Tools\ffmpeg\bin\ffmpeg.exe`.
 
-Then run from the project root:
-
-```powershell
-.\build.ps1 -JavaHome 'C:\Tools\jdk-17' -FfmpegPath 'C:\Tools\ffmpeg\bin\ffmpeg.exe'
-```
-
-The release archive is written to `dist`. If the Android SDK is not in its default location, also pass `-AndroidSdk 'path-to-SDK'`.
+Then run `Build-And-Install-Mirror-To-TV.cmd` from the project root. It builds the release and installs or updates the APK on the TV. The first run asks for the TV IP address; later updates use the saved address. The release archive is written to `dist`.
 
 ## License
 

@@ -8,6 +8,12 @@ set "TVIP=%~1"
 set "TVPORT=%~2"
 set "EXIT_CODE=1"
 
+set "MIRROR_TO_TV_INSTALL_CONFIG=%~dp0mirror-to-tv.config.json"
+if not defined TVIP if exist "%MIRROR_TO_TV_INSTALL_CONFIG%" for /f "tokens=1,* delims==" %%A in ('powershell.exe -NoProfile -Command "try { $config = ConvertFrom-Json (Get-Content -Raw -LiteralPath $env:MIRROR_TO_TV_INSTALL_CONFIG); 'TVIP=' + $config.tvIp; 'TVPORT=' + $config.adbPort } catch {}"') do (
+  if /i "%%A"=="TVIP" set "TVIP=%%B"
+  if /i "%%A"=="TVPORT" set "TVPORT=%%B"
+)
+
 echo.
 echo mirror-to-tv 1.0 installer
 echo ==========================
