@@ -24,6 +24,7 @@ $output = Join-Path $repoRoot 'dist'
 $build = Join-Path $repoRoot 'build'
 $privateDirectory = Join-Path $repoRoot '.private'
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 $tokenWasGenerated = [string]::IsNullOrWhiteSpace($Token)
 if ($tokenWasGenerated) { $Token = New-SecureHex 32 }
@@ -104,15 +105,15 @@ New-Item -ItemType Directory -Force -Path $generatedSource, $classes, $dex, $out
 
 $configTemplate = Join-Path $project 'src\local\lanoverlay\tv\Config.java.template'
 $generatedConfig = Join-Path $generatedSource 'Config.java'
-$configText = (Get-Content -Raw -LiteralPath $configTemplate).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
+$configText = ([IO.File]::ReadAllText($configTemplate, [Text.Encoding]::UTF8)).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
 if ($configText -match '__MIRROR_TO_TV_TOKEN__') { throw 'Could not inject the receiver token.' }
 [IO.File]::WriteAllText($generatedConfig, $configText, $utf8NoBom)
 
 $generatedClient = Join-Path $build 'generated-client\Mirror-To-TV.ps1'
 New-Item -ItemType Directory -Force -Path (Split-Path $generatedClient -Parent) | Out-Null
-$clientText = (Get-Content -Raw -LiteralPath $clientTemplate).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
+$clientText = ([IO.File]::ReadAllText($clientTemplate, [Text.Encoding]::UTF8)).Replace('__MIRROR_TO_TV_TOKEN__', $Token)
 if ($clientText -match '__MIRROR_TO_TV_TOKEN__') { throw 'Could not inject the desktop token.' }
-[IO.File]::WriteAllText($generatedClient, $clientText, $utf8NoBom)
+[IO.File]::WriteAllText($generatedClient, $clientText, $utf8Bom)
 
 $javaBin = Join-Path $JavaHome 'bin'
 $env:JAVA_HOME = $JavaHome

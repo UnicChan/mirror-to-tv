@@ -1458,7 +1458,7 @@ $fileBox.Text = 'No media selected'
 Style-Input $fileBox
 $mediaToolbar.Controls.Add($fileBox)
 $browseButton = New-Object System.Windows.Forms.Button
-$browseButton.Text = '+  ADD MEDIA'
+$browseButton.Text = 'ADD MEDIA'
 $browseButton.Location = New-Object System.Drawing.Point(393, 5)
 $browseButton.Size = New-Object System.Drawing.Size(132, 30)
 Style-Button $browseButton 'accent'
@@ -1662,7 +1662,7 @@ $audioSubtitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7)
 $audioSubtitle.ForeColor = $script:ThemeMuted
 $audioPanel.Controls.Add($audioSubtitle)
 $addAudioButton = New-Object System.Windows.Forms.Button
-$addAudioButton.Text = '+  ADD AUDIO'
+$addAudioButton.Text = 'ADD AUDIO'
 $addAudioButton.Location = New-Object System.Drawing.Point(14, 72)
 $addAudioButton.Size = New-Object System.Drawing.Size(254, 38)
 Style-Button $addAudioButton 'accent'
