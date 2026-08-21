@@ -108,6 +108,9 @@ if errorlevel 1 (
   goto disconnect
 )
 
+powershell.exe -NoProfile -Command "$windowState = (& $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell dumpsys window windows | Out-String); $activityState = (& $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell dumpsys activity activities | Out-String); $foreground = ([regex]::Matches($windowState + $activityState, '(?im)^.*(?:mCurrentFocus|mFocusedApp|mResumedActivity|topResumedActivity).*$').Value -join ' '); if ($foreground -match '(?i)(settings|permissioncontroller|drawoverlay|manageoverlay|displayover)') { & $env:MIRROR_TO_TV_INSTALL_ADB -s $env:MIRROR_TO_TV_INSTALL_SERIAL shell input keyevent KEYCODE_BACK | Out-Null; exit $LASTEXITCODE }; exit 0"
+if errorlevel 1 echo WARNING: The TV permission screen could not be closed automatically.
+
 echo Starting the TV receiver...
 "%ADB%" -s "%SERIAL%" shell am broadcast -a local.lanoverlay.tv.START -n local.lanoverlay.tv/.BootReceiver >nul
 if errorlevel 1 (

@@ -51,7 +51,7 @@ No additional PC software is required: the APK, ADB, and FFmpeg are included in 
 2. Run `Install-Mirror-To-TV.cmd` to install or update the APK. Enter the TV IP address and keep the default ADB port `5555` unless the TV shows a different port.
 3. If an authorization dialog appears on the TV, choose **Always allow from this computer** and then **Allow**.
 
-The installer connects to the TV, installs the APK, grants the overlay permission, starts and verifies the receiver, remembers the TV address, and opens the desktop controller. It does not reboot the TV. To update the APK, run `Install-Mirror-To-TV.cmd` again; it reuses the saved address. If the APK signature differs, the installer offers a complete reinstall; the installed app is not removed without confirmation. For normal use, run `Start-Mirror-To-TV.cmd`.
+The installer connects to the TV, installs the APK, grants the overlay permission, closes an open system permission screen, starts and verifies the receiver, remembers the TV address, and opens the desktop controller. It does not reboot the TV. To update the APK, run `Install-Mirror-To-TV.cmd` again; it reuses the saved address. If the APK signature differs, the installer offers a complete reinstall; the installed app is not removed without confirmation. For normal use, run `Start-Mirror-To-TV.cmd`.
 
 ADB is included in the release archive; Android Studio is not required. Its Apache 2.0 notices are included in `tools/NOTICE.txt`. If the connection fails, confirm that both devices are on the same non-guest network and that the router does not isolate Wi-Fi clients.
 
